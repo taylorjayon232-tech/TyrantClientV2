@@ -1,0 +1,14 @@
+# Build outputs
+build/
+build-verify/
+build_verify/
+.vs/
+
+# Compiler objects
+*.obj
+*.pdb
+*.exe
+
+# Logs
+*.log
+logs/

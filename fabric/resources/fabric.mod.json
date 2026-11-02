@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "passive",
+  "version": "1.0.2",
+  "name": "Passive",
+  "description": "Passive's native client, delivered as a Fabric mod: the jar carries the built passive_agent.dll (the ImGui menu and every module, unchanged) and maps it into the game at startup. Uninject in game and the DLL leaves the process, so the standalone injector can inject it again.",
+  "authors": [
+    "Passive"
+  ],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.passive.fabric.PassiveFabricMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21"
+  }
+}

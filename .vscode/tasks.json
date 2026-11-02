@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build Tyrant Release",
+			"type": "shell",
+			"command": "cmd",
+			"args": [
+				"/c",
+				"build.bat"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
