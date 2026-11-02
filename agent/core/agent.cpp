@@ -277,6 +277,9 @@ DWORD WINAPI unloadThread(LPVOID initThreadHandle) {
     // The pose watchdog may be mid-write through JNI; wait for it to leave its loop before the
     // DLL's code can be freed under it. Bounded, so a wedged thread cannot hang the unload.
     for (int i = 0; i < 3000 && g_watchdogAlive.load(); ++i) Sleep(1);
+    // That thread stores "gone" as the last thing it does, and still has to unwind through this
+    // DLL's runtime afterwards. Give it that moment before the module can be unmapped under it.
+    Sleep(30);
     hooks::uninstall();
     modules::java::shutdown();   // drop the Java host while the VM link is still up
     jni::detach();          // release the class-loader global ref, detach our threads
@@ -288,7 +291,10 @@ DWORD WINAPI unloadThread(LPVOID initThreadHandle) {
     // injection from logging anything - for the rest of the game's life.
     const bool hostManaged = g_hostManaged.load(std::memory_order_acquire);
     trace::log("teardown complete - releasing the log");
-    if (hostManaged) trace::log("teardown complete - the host will release the module");
+    if (hostManaged)
+        trace::log("teardown complete - passiveUnloadComplete is set; the host releases the module");
+    else
+        trace::log("teardown complete - the module frees itself and leaves the process");
     trace::close();
 
     // A host that loaded this DLL (the Fabric bridge) owns the LoadLibrary

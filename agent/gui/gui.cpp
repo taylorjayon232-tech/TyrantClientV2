@@ -2059,6 +2059,9 @@ void drawModuleCards(ImDrawList* dl, ImVec2 origin, float scale, float opacity,
                 setWidgetCursor(pageX+20.f,cardY+137.f,scale); ui::Checkbox("Swap Back",&settings.swapBack);
                 const float halfW=(pageW-40.f-12.f)*0.5f;
                 const float rightX=pageX+32.f+halfW;
+                // Click Simulation: the swing is the game's own Attack key (MinecraftClient.doAttack),
+                // so the hit is the click a player makes rather than one sent at the entity.
+                setWidgetCursor(rightX,cardY+137.f,scale); ui::Checkbox("Click Simulation",&settings.clickSimulation);
                 drawSlider(dl,origin,"automace-range","Range (blocks)","",pageX+20.f,cardY+180.f,halfW,scale,opacity,settings.range,1.f,6.f);
                 drawIntSlider(dl,origin,"automace-hit-min","Hit delay min (ticks)",pageX+20.f,cardY+217.f,halfW,scale,opacity,settings.hitDelayMinTicks,0,20);
                 drawIntSlider(dl,origin,"automace-hit-max","Hit delay max (ticks)",pageX+20.f,cardY+254.f,halfW,scale,opacity,settings.hitDelayMaxTicks,0,20);
@@ -2071,7 +2074,7 @@ void drawModuleCards(ImDrawList* dl, ImVec2 origin, float scale, float opacity,
                 drawIntSlider(dl,origin,"automace-swap-ticks","Swap ticks",rightX,cardY+328.f,halfW,scale,opacity,settings.swapTicks,0,20);
                 drawSlider(dl,origin,"automace-fall-height","Minimum fall height (blocks)","",pageX+20.f,cardY+365.f,pageW-40.f,scale,opacity,settings.minFallHeight,0.f,20.f);
                 ImGui::PopID();
-                drawText(dl,origin,pageX+20.f,cardY+402.f,"It only arms once the fall is at least this tall; a landing cancels the smash.",kDim,8.f,scale,opacity);
+                drawText(dl,origin,pageX+20.f,cardY+402.f,"It only arms once the fall is at least this tall; the smash is committed then.",kDim,8.f,scale,opacity);
                 drawModuleKeybind(dl,origin,*entry,pageX+20.f,cardY+424.f,pageW-40.f,scale,opacity);
             } else if (expanded && std::string(entry->name)=="Auto Shield Break") {
                 modules::AutoShieldBreakSettings& settings=modules::autoShieldBreakSettings();

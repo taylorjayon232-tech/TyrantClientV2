@@ -164,6 +164,12 @@ bool moduleIsMapped(HMODULE module) {
     return false;
 }
 
+// Whether the mapped agent can report completion at all. A payload without the export can never
+// answer, so the release watcher must not wait on it for the rest of the game's life.
+bool hasTeardownExport(HMODULE module) {
+    return module && GetProcAddress(module, "passiveUnloadComplete") != nullptr;
+}
+
 bool agentTeardownComplete(HMODULE module) {
     using CompleteFn = int(__cdecl*)();
     const auto complete = reinterpret_cast<CompleteFn>(GetProcAddress(module, "passiveUnloadComplete"));
@@ -216,17 +222,32 @@ DWORD WINAPI releaseAgentModule(LPVOID) {
             continue;
         }
         if (now - absentSince < 250) continue;
-        if (!agentTeardownComplete(owned)) continue;
+        // An agent confirms its teardown through passiveUnloadComplete. A payload without that export
+        // can never confirm, and waiting on it forever leaves the DLL in the process after an
+        // "uninject" - so for those the handshake staying away for a few seconds is the signal.
+        if (!agentTeardownComplete(owned)) {
+            if (hasTeardownExport(owned) || now - absentSince < 4000) continue;
+            trace("the mapped agent has no passiveUnloadComplete; releasing after its handshake went away");
+        }
 
         // The unload thread sets the flag and then returns. Give it time to
         // leave the DLL before the module is unmapped under it.
         Sleep(500);
-        if (moduleIsMapped(owned)) {
-            trace("releasing the agent module after its teardown");
+        // Release every reference this bridge can reach, not just one: a second loader reference (a
+        // copy something else mapped, or a re-inject that reused this module) would otherwise keep
+        // the DLL resident even though the client had finished tearing itself down.
+        for (int attempt = 0; attempt < 8 && moduleIsMapped(owned); ++attempt) {
+            trace("releasing the agent module after its teardown (reference %d)", attempt + 1);
             if (!FreeLibrary(owned)) {
                 trace("WARN: FreeLibrary on the agent module failed (error %lu)",
                       (unsigned long)GetLastError());
+                break;
             }
+            Sleep(50);
+        }
+        if (moduleIsMapped(owned)) {
+            trace("WARN: the agent module is still mapped after its teardown - "
+                  "a loader reference outside this bridge is holding it");
         }
 
         g_ownedModule.store(nullptr, std::memory_order_release);

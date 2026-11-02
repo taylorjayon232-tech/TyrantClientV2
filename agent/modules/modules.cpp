@@ -2680,11 +2680,111 @@ enum class MacePhase { Idle, AxeSwap, AxeWind, ChestOff, MaceSelect, MaceWind, R
 MacePhase g_macePhase = MacePhase::Idle;
 double g_maceStageAt = 0.0;
 double g_maceNextAt = 0.0;
+double g_maceSwingDeadline = 0.0;   // a refused swing is retried until then, then the sequence ends
 std::string g_maceTarget;
 int  g_maceOrigSlot = -1;
 bool g_maceChestSwapped = false;
 bool g_maceAxeRetried = false;
 constexpr double kMaceTick = 0.05;          // one game tick, in the overlay's clock
+// How long one swing step may wait for the game to be able to attack: an axe hit empties the attack
+// charge and the mace refills it in about a second and a half, while the axe's shield disable lasts
+// five - so this stays inside the window a stun slam has without leaving a step open forever.
+constexpr double kMaceSwingWait = 2.5;
+
+// ---- the swing (Click Simulation) ----------------------------------------------------------
+// Defined with the V2 engine further down: the crosshair test and the aim are the same rules V2
+// swings by, so the two engines cannot disagree about what "on the target" means.
+bool maceV2AimAt(mc::Player& player, jobject targetObj);
+bool maceV2CrosshairOn(jobject targetObj, const mc::Player& player, float maxDistance);
+
+enum class MaceSwingResult { Sent, Aimed, Waiting, Failed };
+
+// Is `id` the item in the player's main hand right now? The mace step must never swing the axe it
+// swapped away from - which on screen is exactly "the shield was stunned but no mace hit landed".
+bool maceHolding(jobject playerObj, const char* id) {
+    if (!playerObj) return false;
+    mc::LocalRef hand(mc::LivingEntity(playerObj).mainHandStack());
+    return hand && mc::stk::itemId(hand.get()) == id;
+}
+
+// Is the game ready to make an attack? doAttack() only sends one while the attack charge is full,
+// and after a stun slam's axe hit the charge is empty - the wait the old engine never made.
+bool maceSwingCharged(mc::Player& player) {
+    if (mc::Client::attackCooldown() > 0) return false;
+    return player.attackCooldownProgress(1.f) >= 0.9f;
+}
+
+// The game's own crosshair pick is this target. The pick is refreshed on the game's tick, so a frame
+// that has only just aimed still reads the previous hit; the ray test against the current view covers
+// that window (the same test V2 swings by).
+bool maceCrosshairOn(jobject targetObj, mc::Player& player, float range) {
+    if (!targetObj) return false;
+    JNIEnv* env = jni::env();
+    if (!env) return false;
+    mc::LocalRef hit(mc::Client::crosshair());
+    if (hit && mc::hit::typeOf(hit.get()) == 2) {
+        mc::LocalRef picked(mc::hit::entity(hit.get()));
+        const bool same = picked && env->IsSameObject(picked.get(), targetObj) == JNI_TRUE;
+        jni::clearException(env, "automace crosshair compare");
+        if (!same) return false;        // doAttack() would attack whatever this is instead
+        return true;
+    }
+    // A block in front of the target is what doAttack() would mine instead, so the ray fallback only
+    // stands while the game's own pick is not a block.
+    if (hit && mc::hit::typeOf(hit.get()) == 1) return false;
+    return maceV2CrosshairOn(targetObj, player, range);
+}
+
+// One swing at the tracked target, made the way a player makes it.
+//
+// Click Simulation (the default) is MinecraftClient.doAttack(): the game re-picks its crosshair, checks
+// its own attack charge, attacks, swings the hand and sends the packets - one attack + one swing, and
+// nothing a real click would not send. The game can refuse it (charge empty, or the target knocked a
+// few degrees off the crosshair by the axe), so the step is retried instead of skipped: Aimed turned
+// the view onto the target and Waiting is the charge refilling, both mean "the same step next frame".
+// Failed only appears once the wait ran out, so a swing that never becomes possible cannot loop.
+MaceSwingResult maceTrySwing(mc::Player& player, jobject targetObj, bool requireMace, float range,
+                             double now) {
+    jobject playerObj = mc::Client::player();
+    if (!targetObj || !playerObj) return MaceSwingResult::Failed;
+
+    // Click Simulation off: the interaction manager's attack straight at the tracked entity, with the
+    // hand swing sent by us. No charge gate, so it always goes out.
+    if (!g_autoMaceSettings.clickSimulation) {
+        if (!mc::Client::attackEntity(targetObj)) return MaceSwingResult::Failed;
+        player.swingHand();
+        noteModuleSwing(now);
+        return MaceSwingResult::Sent;
+    }
+
+    if (g_maceSwingDeadline <= 0.0) g_maceSwingDeadline = now + kMaceSwingWait;
+    const bool expired = now >= g_maceSwingDeadline;
+
+    if (requireMace && !maceHolding(playerObj, "mace"))
+        return expired ? MaceSwingResult::Failed : MaceSwingResult::Waiting;
+
+    // doAttack() would hit whatever else the crosshair points at (a block included), so the target has
+    // to be the pick before the click goes out. Aiming back onto it is what makes the swing land after
+    // the axe's knockback moved it.
+    if (!maceCrosshairOn(targetObj, player, range)) {
+        if (expired) return MaceSwingResult::Failed;
+        maceV2AimAt(player, targetObj);
+        g_maceStageAt = now + kMaceTick;      // one game tick for the game to re-pick
+        return MaceSwingResult::Aimed;
+    }
+
+    if (!maceSwingCharged(player) || !mc::Client::doAttack()) {
+        if (expired) return MaceSwingResult::Failed;
+        g_maceStageAt = now + kMaceTick * 0.5;   // the charge refills on the game's tick
+        return MaceSwingResult::Waiting;
+    }
+
+    // The game made the attack and swung the hand itself, so there is no second swing here. Every
+    // follow-up that answers a swing (Auto Shield Break's OnHit mode) is told about it instead.
+    noteModuleSwing(now);
+    g_maceSwingDeadline = 0.0;
+    return MaceSwingResult::Sent;
+}
 
 int maceRandTicks(int lo, int hi) {
     lo = std::clamp(lo, 0, 40); hi = std::clamp(hi, 0, 40);
@@ -2770,6 +2870,7 @@ void maceResetState(bool restore) {
     g_maceChestSwapped = false;
     g_maceAxeRetried = false;
     g_maceStageAt = 0.0;
+    g_maceSwingDeadline = 0.0;
 }
 
 void updateAutoMace() {
@@ -2819,6 +2920,7 @@ void updateAutoMace() {
             g_maceTarget = key;
             g_maceOrigSlot = std::clamp(mc::inv::selectedSlot(inventory.get()), 0, 8);
             g_maceAxeRetried = false;
+            g_maceSwingDeadline = 0.0;      // every step of the slam gets its own swing window
             const int axe = maceFindHotbarAxe(list.get());
             if (st.stunSlam && axe >= 0 && mc::LivingEntity(target.get()).blocking()) {
                 selectSlot(inventory.get(), axe);
@@ -2834,9 +2936,16 @@ void updateAutoMace() {
             if (now < g_maceStageAt) return;
             mc::LocalRef target = targetAlive(0.5f);
             if (!target) { maceResetState(true); return; }
-            if (mc::Client::attackEntity(target.get())) { local.swingHand(); noteModuleSwing(now); }
-            g_macePhase = MacePhase::AxeWind;
-            g_maceStageAt = now + std::max(0, st.axeTicks) * kMaceTick;
+            // The stun hit is the game's own click too, so it waits for what the game needs (the
+            // charge, the crosshair) instead of being skipped - a stun slam whose axe is skipped has
+            // nothing left to break the shield with.
+            const MaceSwingResult swing = maceTrySwing(local, target.get(), false, st.range + 0.5f, now);
+            if (swing == MaceSwingResult::Sent) {
+                g_macePhase = MacePhase::AxeWind;
+                g_maceStageAt = now + std::max(0, st.axeTicks) * kMaceTick;
+            } else if (swing == MaceSwingResult::Failed) {
+                maceResetState(true);       // the axe never became possible: do not stun half way
+            }
             return;
         }
         case MacePhase::AxeWind: {
@@ -2846,8 +2955,9 @@ void updateAutoMace() {
             // One retry while the shield is still up, then the mace takes over.
             if (!g_maceAxeRetried && mc::LivingEntity(target.get()).blocking()) {
                 g_maceAxeRetried = true;
-                if (mc::Client::attackEntity(target.get())) { local.swingHand(); noteModuleSwing(now); }
-                g_maceStageAt = now + std::max(0, st.axeTicks) * kMaceTick;
+                g_maceSwingDeadline = 0.0;
+                g_maceStageAt = now;
+                g_macePhase = MacePhase::AxeSwap;   // the axe step again, with a fresh swing window
                 return;
             }
             g_macePhase = MacePhase::ChestOff;
@@ -2876,16 +2986,28 @@ void updateAutoMace() {
         }
         case MacePhase::MaceWind: {
             if (now < g_maceStageAt) return;
-            // The fall was spent before the wind-up finished (the player landed, or a block cut it
-            // short): the smash would deal a ground hit, so it is abandoned instead.
-            if (st.minFallHeight > 0.01f &&
-                (local.onGround() || local.fallDistance() < st.minFallHeight)) {
-                maceResetState(true);
-                return;
-            }
+            // The fall is read once, when the sequence ARMS (see Idle), and never again here. The axe
+            // hit and the wait for the attack charge both spend the fall, and re-testing it here is
+            // what ended every stun slam after the shield was already down: the player lands a few
+            // ticks after the axe, the mace step then saw ground and cancelled - "it stuns the shield
+            // but never hits with the mace". Arming still needs the fall, which is the part that
+            // decides whether this is a smash at all.
             mc::LocalRef target = targetAlive(0.5f);
             if (!target) { maceResetState(true); return; }
-            if (mc::Client::attackEntity(target.get())) { local.swingHand(); noteModuleSwing(now); }
+            const int mace = maceFindHotbar(list.get(), "mace");
+            if (mace < 0) { maceResetState(true); return; }
+            if (!maceHolding(playerObj, "mace")) {
+                // The hotbar selection did not take: put the mace back in hand and give it its tick
+                // instead of swinging whatever is there now (the axe, after a stun slam).
+                selectSlot(inventory.get(), mace);
+                g_maceStageAt = now + std::max(1, st.swapTicks) * kMaceTick;
+                return;
+            }
+            const MaceSwingResult swing = maceTrySwing(local, target.get(), true, st.range + 0.5f, now);
+            if (swing != MaceSwingResult::Sent) {
+                if (swing == MaceSwingResult::Failed) maceResetState(true);
+                return;                     // Aimed / Waiting: the same step runs again next frame
+            }
             g_macePhase = MacePhase::Restore;
             g_maceStageAt = now + maceRandTicks(st.reswapMinTicks, st.reswapMaxTicks) * kMaceTick;
             return;
@@ -3018,26 +3140,9 @@ bool playerAttackInputHeld() {
 
 
 
-// Re-checks the target captured when the sequence started. Tracking it by UUID
-// means swapping to a shorter-reach item (which changes the crosshair pick) can
-// no longer make the module drop the target mid stun-slam / smash.
-
-// One attack at the tracked target: the ordinary click when the crosshair is on
-// it (so nothing else, like a block, gets hit), otherwise the tracked entity
-// directly (needed after a spear-reach swap).
-bool maceAttack(mc::Player& player,jobject targetObj) {
-    if (!targetObj) return false;
-    JNIEnv* env=jni::env();
-    if (!env) return false;
-    mc::LocalRef hit(mc::Client::crosshair());
-    mc::LocalRef crossTarget;
-    if (hit && mc::hit::typeOf(hit.get())==2) crossTarget=mc::LocalRef(mc::hit::entity(hit.get()));
-    const bool onTarget=crossTarget && env->IsSameObject(crossTarget.get(),targetObj)==JNI_TRUE;
-    jni::clearException(env,"mace crosshair compare");
-    const bool attacked=onTarget ? mc::Client::doAttack() : mc::Client::attackEntity(targetObj);
-    if (attacked) { player.swingHand(); g_attackSentThisFrame=true; }
-    return attacked;
-}
+// The target captured when the sequence started is tracked by UUID (see targetAlive inside
+// updateAutoMace), so swapping to a shorter-reach item - which changes the crosshair pick - can no
+// longer make the module drop the target mid stun-slam / smash. The swing itself is maceTrySwing.
 
 
 // ---- AimAssist ----------------------------------------------------------------------------
@@ -7309,7 +7414,9 @@ std::string serialize() {
         {"allEntities",g_triggerbotSettings.allEntities},
         {"samePlayer",g_triggerbotSettings.samePlayer},
         {"criticals",(int)g_triggerbotSettings.criticals}};
-    j["autoMace"]={{"stunSlam",g_autoMaceSettings.stunSlam},{"elytraSwap",g_autoMaceSettings.elytraSwap},
+    j["autoMace"]={{"stunSlam",g_autoMaceSettings.stunSlam},
+        {"clickSimulation",g_autoMaceSettings.clickSimulation},
+        {"elytraSwap",g_autoMaceSettings.elytraSwap},
         {"swapBack",g_autoMaceSettings.swapBack},{"range",g_autoMaceSettings.range},
         {"minFallHeight",g_autoMaceSettings.minFallHeight},
         {"hitDelayMinTicks",g_autoMaceSettings.hitDelayMinTicks},
@@ -7497,6 +7604,7 @@ bool deserialize(const std::string& jsonText) {
         g_triggerbotSettings.criticals=(CritMode)std::clamp(tb.value("criticals",0),0,2);
         const auto am=j.value("autoMace",nlohmann::json::object());
         g_autoMaceSettings.stunSlam=am.value("stunSlam",false);
+        g_autoMaceSettings.clickSimulation=am.value("clickSimulation",true);
         g_autoMaceSettings.elytraSwap=am.value("elytraSwap",true);
         g_autoMaceSettings.swapBack=am.value("swapBack",true);
         g_autoMaceSettings.range=std::clamp(am.value("range",3.f),1.f,6.f);

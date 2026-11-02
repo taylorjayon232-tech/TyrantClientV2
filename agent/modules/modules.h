@@ -206,6 +206,10 @@ struct TriggerbotSettings {
 // lands on the exposed hit.
 struct AutoMaceSettings {
     bool stunSlam = false;         // axe first, then the mace, against a raised shield
+    // Click Simulation: the swing is MinecraftClient.doAttack() - the game's own Attack key - so the
+    // hit is exactly the click a player makes (one attack, one swing, the game's own crosshair pick
+    // and attack charge). Off sends the attack straight at the target instead, with no charge wait.
+    bool clickSimulation = true;
     bool elytraSwap = true;        // elytra off for a carried chestplate before the smash
     bool swapBack = true;          // original hotbar slot back after the sequence
     float range = 3.f;             // blocks, as in Argon's REACH

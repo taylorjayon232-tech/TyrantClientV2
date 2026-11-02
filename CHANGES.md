@@ -1,3 +1,29 @@
+# Passive - AutoMace Click Simulation, the StunSlam's mace hit, and a real uninject
+
+## AutoMace / StunSlam
+- **StunSlam lands the mace hit again.** The fall is read once, when the sequence ARMS; the mace step no
+  longer re-tests it. The axe hit and the wait for the attack charge both spend the fall, so the old
+  second check saw the ground a few ticks after the axe and cancelled the smash - exactly the "it stuns
+  the shield but never hits with the mace" report. The mace is also confirmed to be the held item before
+  the swing, so a hotbar selection that did not take is retried instead of swinging the axe again.
+- **Click Simulation** (new checkbox on the AutoMace card, on by default) makes every swing
+  `MinecraftClient.doAttack()` - the call the physical Attack And Destroy key makes - so the game sends
+  one attack and one swing against its own crosshair pick and its own attack charge, instead of a raw
+  `attackEntity` plus a second hand swing. A swing the game refuses (the charge the stun slam's axe just
+  emptied, or a target the axe knocked a few degrees off the crosshair) is retried on a later frame
+  rather than dropped: the step aims back onto the target and waits for the charge, bounded by the axe's
+  five-second shield disable. With Click Simulation off the module keeps the direct attack at the
+  tracked entity, which has no charge gate.
+
+## Uninject / unload
+- An uninject now really takes the module out of the process on every path. The bridge releases every
+  loader reference it can reach instead of only one, and says so in `passive_agent.log` when something
+  outside it still holds the DLL. A payload without `passiveUnloadComplete` is released once its
+  handshake has been gone for a few seconds instead of being waited on forever (that wait is what left
+  an old build mapped until the launcher restarted).
+- Teardown gives the pose-watchdog thread its moment to leave this DLL's own code before the hooks come
+  out and the module can be unmapped under it.
+
 # Passive 1.0.2 - silent aim tracking, placement settling, the new library shell
 
 ## Java module host (hybrid)
