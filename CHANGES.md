@@ -1,5 +1,24 @@
 # Passive - AutoMace rebuilt around the real Attack click, in milliseconds
 
+## Passive - StunSlam retries the stun, No Glide, Triggerbot waits for the charge
+
+- **StunSlam no longer spends the mace on a raised shield.** After the axe swing the target is
+  checked again: a shield still up means the swing did not stun (it landed before the server had the
+  shield, or the shield came back), so the axe goes back in and swings again - at most three times -
+  instead of the mace hitting a shield. The smash re-checks the shield too, so a target that re-raises
+  it gets the axe again.
+- **AutoMace has a No Glide checkbox.** An elytra glide cannot land a smash, so with it on the
+  sequence does not arm while the player is gliding. Saved with the other AutoMace settings.
+- **Triggerbot waits for the weapon's own attack charge.** The millisecond window still paces the
+  card, but the click also waits until the attack cooldown has recovered, so a swing never lands on a
+  weapon that has not recharged. The window and the charge gate together: whichever is later wins.
+- **Drag Click emits every click slot a frame owes.** The scheduler used to answer one yes/no per
+  frame, so a card set to 40 CPS topped out at the frame rate (~8). Each due slot is now its own
+  complete click, capped at six per frame so a hitch cannot queue a burst.
+- **Silent Aim hands the game's crosshair pick the aim target.** The HUD attack indicator and the
+  block outline both read `crosshairTarget`; while the aim holds a target that field is set to it,
+  so the indicator shows and the block behind the camera stops being outlined while the view stays put.
+
 ## AutoMace
 - **The whole card clicks now, and it clicks the real thing.** Click Simulation is not a setting any
   more: every AutoMace swing is a left click posted to the game window, so the game handles it through

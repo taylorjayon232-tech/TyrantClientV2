@@ -2055,9 +2055,10 @@ void drawModuleCards(ImDrawList* dl, ImVec2 origin, float scale, float opacity,
                 ImGui::PushID("automace-options");
                 setWidgetCursor(pageX+20.f,cardY+77.f,scale); ui::Checkbox("StunSlam (axe first)",&settings.stunSlam);
                 setWidgetCursor(pageX+20.f,cardY+107.f,scale); ui::Checkbox("Elytra Swap",&settings.elytraSwap);
-                setWidgetCursor(pageX+20.f,cardY+137.f,scale); ui::Checkbox("Swap Back",&settings.swapBack);
                 const float halfW=(pageW-40.f-12.f)*0.5f;
                 const float rightX=pageX+32.f+halfW;
+                setWidgetCursor(pageX+20.f,cardY+137.f,scale); ui::Checkbox("Swap Back",&settings.swapBack);
+                setWidgetCursor(rightX,cardY+137.f,scale); ui::Checkbox("No Glide",&settings.noGlide);
                 // Every delay on this card is milliseconds: what the slider says is when the click
                 // goes out, not how many game ticks to wait for.
                 drawSlider(dl,origin,"automace-range","Range (blocks)","",pageX+20.f,cardY+180.f,halfW,scale,opacity,settings.range,1.f,6.f);

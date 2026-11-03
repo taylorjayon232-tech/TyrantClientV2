@@ -172,6 +172,10 @@ public:
     static float renderFov(float tickDelta, bool changedFov = true);
 
     static jobject crosshair();       // game's own crosshairTarget (HitResult)
+    // Point the game's crosshairTarget at `entity` (null = miss). The HUD's attack indicator and the
+    // block outline both read this one field, so a silent aim can show the indicator and drop the
+    // block outline without the camera moving. The game recomputes the pick each frame.
+    static bool setCrosshairTargetEntity(jobject entity);
     // Fluid-aware pick from the camera entity (Entity.raycast with includeFluids=true).
     // The game's own crosshairTarget ignores fluids, so water is never "hit" by it.
     static jobject raycastWithFluids(double range, float tickDelta);   // local ref or null

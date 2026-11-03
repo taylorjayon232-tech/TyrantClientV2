@@ -95,6 +95,21 @@ struct Timer {
     void reset() { armed = false; next = 0.0; }
 };
 
+// How many click slots have come due, capped at `maxSlots`. A frame longer than one slot leaves
+// several clicks owed: a scheduler that can only say "one click now" loses every slot the frame
+// skipped, which caps the module at the frame rate however high Maximum CPS is set.
+inline int slotsDue(Timer& timer, double now, double interval, int maxSlots) {
+    if (!(interval > 0.0) || maxSlots <= 0) return 0;
+    if (!timer.armed) { timer.armed = true; timer.next = now; }
+    int count = 0;
+    while (count < maxSlots && now + 1e-9 >= timer.next) {
+        ++count;
+        timer.next += interval;
+    }
+    if (timer.next <= now) timer.next = now + interval;   // slots past the cap are dropped, never queued
+    return count;
+}
+
 } // namespace pace
 } // namespace modules
 } // namespace tyr

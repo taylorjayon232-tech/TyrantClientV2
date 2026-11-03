@@ -879,6 +879,41 @@ bool Client::isPressurePlateAt(int x, int y, int z) {
     return id.size()>=14 && id.compare(id.size()-14,14,"pressure_plate")==0;
 }
 bool Client::isCobwebAt(int x, int y, int z) { return blockIdAt(x,y,z) == "cobweb"; }
+bool Client::setCrosshairTargetEntity(jobject entity) {
+    JNIEnv* e = jni::env();
+    if (!e || !g_resolved || !g_client) return false;
+    static jfieldID crossField = nullptr;
+    static bool probed = false;
+    if (!probed) {
+        probed = true;
+        jclass clientClass = e->GetObjectClass(g_client);
+        crossField = e->GetFieldID(clientClass, fld::kClient_crosshair, "Lnet/minecraft/class_239;");
+        jni::clearException(e, "crosshairTarget (write)");
+        e->DeleteLocalRef(clientClass);
+    }
+    if (!crossField) return false;
+    LocalRef built;
+    if (entity) {
+        jclass hitCls = jni::findClass(e, "net/minecraft/class_3966");   // EntityHitResult
+        if (!hitCls) return false;
+        const jmethodID ctor = e->GetMethodID(hitCls, "<init>",
+            "(Lnet/minecraft/class_1297;Lnet/minecraft/class_243;)V");
+        jni::clearException(e, "EntityHitResult ctor");
+        if (ctor) {
+            const Vec3 p = Entity(entity).pos();
+            LocalRef vec(e->NewObject(g_sym.vec3d, g_sym.vec3d_ctor,
+                                      (jdouble)p.x, (jdouble)p.y, (jdouble)p.z));
+            jni::clearException(e, "EntityHitResult vec");
+            if (vec) built = LocalRef(e->NewObject(hitCls, ctor, entity, vec.get()));
+            jni::clearException(e, "EntityHitResult construction");
+        }
+        e->DeleteLocalRef(hitCls);
+    }
+    e->SetObjectField(g_client, crossField, built ? built.get() : nullptr);
+    jni::clearException(e, "crosshairTarget set");
+    return true;
+}
+
 jobject Client::crosshair() {
     JNIEnv* e = jni::env();
     if (!e || !g_resolved || !g_client) return nullptr;

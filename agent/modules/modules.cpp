@@ -2662,7 +2662,10 @@ void updateTriggerbot() {
         now - g_triggerLastSwingAt < (g_triggerDelayMs / 1000.0) * 2.0) return;
 
     // The swing is a real left click posted to the game window, so the game makes the attack itself
-    // through its own Attack And Destroy binding. A press already in flight is this frame's click.
+    // through its own Attack And Destroy binding. The millisecond window paces the card; the swing
+    // also waits for the weapon's own attack charge, because a click on a weapon that has not
+    // recovered lands no damage. Both are gates: whichever comes last is when the hit goes out.
+    if (local.attackCooldownProgress(1.f) < 0.99f) return;
     if (!clickAttackPress(now)) return;
 
     // The swing is announced, so Auto Shield Break's OnHit mode answers it exactly as it answers a
@@ -2695,6 +2698,11 @@ double g_maceNextAt = 0.0;        // when the next sequence may arm
 std::string g_maceTarget;         // UUID of the entity the sequence was armed on
 int  g_maceOrigSlot = -1;         // hotbar slot to give back afterwards
 bool g_maceChestSwapped = false;  // the chestplate went on, so the elytra has to come back
+// How many axe swings a StunSlam has already spent on a shield that is still up. A shield only
+// drops when the server's tick applies the axe disable, so a swing that lands a frame early leaves
+// the target blocking; the sequence swings again instead of spending the mace on a raised shield.
+constexpr int kMaceAxeTries = 3;
+int g_maceAxeTries = 0;
 int  g_maceHitDelayMs = 0;        // the hit delay rolled for this smash
 
 int maceRandMs(int lo, int hi) {
@@ -2791,6 +2799,7 @@ void maceResetState(bool restore) {
     g_maceStageAt = 0.0;
     g_maceTarget.clear();
     g_maceHitDelayMs = 0;
+    g_maceAxeTries = 0;
     g_maceOrigSlot = -1;
     g_maceChestSwapped = false;
 }
@@ -2828,6 +2837,9 @@ void updateAutoMace() {
             if (now < g_maceNextAt) return;
             // Minimum Fall Height: the mace's damage is a function of the fall, so the sequence does
             // not arm until the player is falling that far. 0 keeps the ground-level use.
+            // No Glide: a smash out of an elytra glide does not connect, so the sequence does not
+            // arm at all while the elytra is carrying the player.
+            if (st.noGlide && local.gliding()) return;
             if (st.minFallHeight > 0.01f &&
                 (local.onGround() || local.fallDistance() < st.minFallHeight)) return;
             mc::LocalRef crosshair(mc::Client::crosshair());
@@ -2869,6 +2881,7 @@ void updateAutoMace() {
             }
             if (!clickAttackPress(now)) return;
             noteModuleSwing(now);
+            ++g_maceAxeTries;
             g_macePhase = MacePhase::AxeWait;
             g_maceStageAt = now + maceSeconds(maceRandMs(st.axeDelayMinMs, st.axeDelayMaxMs));
             return;
@@ -2877,6 +2890,19 @@ void updateAutoMace() {
             if (now < g_maceStageAt) return;
             mc::LocalRef target = targetAlive(0.5f);
             if (!target) { maceResetState(true); return; }
+            // The shield is the whole point of the axe: a target still blocking here means the swing
+            // did not stun (it landed before the server had the shield up, or the shield went back
+            // up). Swing the axe again instead of hammering a raised shield with the mace; a target
+            // that never drops it ends the sequence and re-arms on the next fall.
+            if (mc::LivingEntity(target.get()).blocking()) {
+                if (g_maceAxeTries >= kMaceAxeTries) { maceResetState(true); return; }
+                const int axe = maceFindHotbarAxe(list.get());
+                if (axe < 0) { maceResetState(true); return; }
+                if (!maceHoldingSlotItem(list.get(), playerObj, axe)) selectSlot(inventory.get(), axe);
+                g_macePhase = MacePhase::AxeSwing;
+                g_maceStageAt = now + maceSeconds(maceRandMs(st.axeDelayMinMs, st.axeDelayMaxMs));
+                return;
+            }
             g_macePhase = MacePhase::ChestOff;
             g_maceStageAt = now;
             return;
@@ -2931,6 +2957,17 @@ void updateAutoMace() {
             if (now < g_maceStageAt) return;
             mc::LocalRef target = targetAlive(0.5f);
             if (!target) { maceResetState(true); return; }
+            // A shield that came back up between the stun and the smash would eat the mace hit: put
+            // the axe back in and stun it again rather than wasting the smash.
+            if (st.stunSlam && mc::LivingEntity(target.get()).blocking() && g_maceAxeTries < kMaceAxeTries) {
+                const int axe = maceFindHotbarAxe(list.get());
+                if (axe >= 0) {
+                    selectSlot(inventory.get(), axe);
+                    g_macePhase = MacePhase::AxeSwing;
+                    g_maceStageAt = now + maceSeconds(st.swapDelayMs);
+                    return;
+                }
+            }
             const int mace = maceFindHotbar(list.get(), "mace");
             if (mace < 0) { maceResetState(true); return; }
             if (!maceHoldingSlotItem(list.get(), playerObj, mace)) {
@@ -3759,6 +3796,12 @@ void updateAimAssist() {
         // the action is being validated against, and the next update after the handoff hands the
         // aim back through one ordinary movement packet.
         if (!acting) silentAimSend(playerObj, aimYaw, aimPitch);
+        // The game's crosshair pick is what the HUD's attack indicator and the block outline read.
+        // While the aim holds a target the pick is set to that entity, exactly as it would be if the
+        // camera had turned: the indicator draws and the block behind the camera stops being
+        // outlined, while the view itself never moves. The game recomputes the pick every frame, so
+        // this is renewed per frame and needs no teardown.
+        mc::Client::setCrosshairTargetEntity(bestTarget.get());
 
         // The tick that carries the pinned aim is the gate for the hit, never the camera.
         // Entity.age changes once per game tick, and sendMovementPackets runs inside that tick with
@@ -3871,6 +3914,7 @@ double g_dragHeldAt = 0.0;
 bool g_dragHeld = false;
 bool g_dragButtonDown = false;
 double g_dragReleaseAt = 0.0;
+constexpr int kDragSlotsPerFrame = 6;   // a skipped frame owes clicks, not an endless burst
 
 void updateDragClick() {
     const bool usable = g_dragClick && !gui::inputFrozen() && jni::ready() &&
@@ -3887,17 +3931,23 @@ void updateDragClick() {
     if (!g_dragHeld) { g_dragHeld = true; g_dragHeldAt = now; g_dragTimer.reset(); }
     // Let go of the previous click first: a press and a release inside one game tick are read as
     // no click at all, so the button is held for part of the interval and released in between.
-    if (g_dragButtonDown && now >= g_dragReleaseAt) { hooks::syntheticClick(false); g_dragButtonDown = false; }
-    if (g_dragButtonDown) return;
+    if (g_dragButtonDown) { hooks::syntheticClick(false); g_dragButtonDown = false; }
     const DragClickSettings& st = g_dragClickSettings;
     const pace::Cycle cycle = pace::cycleAt(st.minCps, st.maxCps, st.acceleration, st.pauseSeconds,
                                             now - g_dragHeldAt);
     if (!cycle.clicking || cycle.cps <= 0.0) return;
     const double interval = 1.0 / cycle.cps;
-    if (!g_dragTimer.due(now, interval)) return;
-    hooks::syntheticClick(true);
-    g_dragButtonDown = true;
-    g_dragReleaseAt = now + std::min(0.02, interval * 0.6);
+    // Several slots can come due in one frame, and every one of them is owed a click. A scheduler
+    // that can only answer yes/no per frame throws away every slot a slow frame skipped, which caps
+    // the module at the frame rate - that is why a card set to 40 CPS topped out around 8. Each due
+    // slot is a complete click here, bounded so one hitch cannot queue an endless burst.
+    const int slots = pace::slotsDue(g_dragTimer, now, interval, kDragSlotsPerFrame);
+    if (slots <= 0) return;
+    for (int i = 0; i < slots; ++i) {
+        hooks::syntheticClick(true);
+        hooks::syntheticClick(false);
+    }
+    g_dragReleaseAt = now;
 }
 
 // Misc: attack whatever the crosshair ray reaches from a range vanilla never allows. Vanilla's
@@ -7343,7 +7393,7 @@ std::string serialize() {
         {"criticals",(int)g_triggerbotSettings.criticals}};
     j["autoMace"]={{"stunSlam",g_autoMaceSettings.stunSlam},
         {"elytraSwap",g_autoMaceSettings.elytraSwap},
-        {"swapBack",g_autoMaceSettings.swapBack},{"range",g_autoMaceSettings.range},
+        {"swapBack",g_autoMaceSettings.swapBack},{"noGlide",g_autoMaceSettings.noGlide},{"range",g_autoMaceSettings.range},
         {"minFallHeight",g_autoMaceSettings.minFallHeight},
         {"hitDelayMinMs",g_autoMaceSettings.hitDelayMinMs},
         {"hitDelayMaxMs",g_autoMaceSettings.hitDelayMaxMs},
@@ -7532,6 +7582,7 @@ bool deserialize(const std::string& jsonText) {
         g_autoMaceSettings.stunSlam=am.value("stunSlam",false);
         g_autoMaceSettings.elytraSwap=am.value("elytraSwap",true);
         g_autoMaceSettings.swapBack=am.value("swapBack",true);
+        g_autoMaceSettings.noGlide=am.value("noGlide",false);
         g_autoMaceSettings.range=std::clamp(am.value("range",3.f),1.f,6.f);
         g_autoMaceSettings.minFallHeight=std::clamp(am.value("minFallHeight",2.5f),0.f,20.f);
         g_autoMaceSettings.hitDelayMinMs=std::clamp(am.value("hitDelayMinMs",0),0,500);

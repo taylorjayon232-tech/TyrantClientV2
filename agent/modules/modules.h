@@ -209,6 +209,9 @@ struct TriggerbotSettings {
 struct AutoMaceSettings {
     bool stunSlam = false;         // axe first, then the mace, against a raised shield
     bool elytraSwap = true;        // the hotbar chestplate goes on (elytra off) before the smash
+    bool noGlide = false;         // do nothing while an elytra glide is carrying the player:
+                                  // a smash out of a glide does not connect, so the card stays
+                                  // off the ground instead of wasting the swap.
     bool swapBack = true;          // original hotbar slot back after the sequence
     float range = 3.f;             // blocks, as in Argon's REACH
     // Minimum Fall Height: a smash only arms while the player has fallen at least this many blocks,
