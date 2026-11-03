@@ -190,7 +190,6 @@ struct TriggerbotSettings {
     int axeDelayMinMs = 780;       // random delay window for axes
     int axeDelayMaxMs = 800;
     bool checkShield = false;      // skip a target whose raised shield faces us
-    bool clickSimulation = false;  // post the click to the game window instead of attacking directly
     bool strayBypass = false;      // treat zombies as targets too
     bool allEntities = false;      // hit any living entity under the crosshair
     bool samePlayer = false;       // stay on the target the last swing went to
@@ -204,27 +203,26 @@ struct TriggerbotSettings {
 // let the mace take the swing on a random delay and put the elytra back afterwards. StunSlam opens
 // the same swing with the hotbar axe - the raised shield comes down, the mace goes in and the smash
 // lands on the exposed hit.
+// AutoMace clicks the way a player does - the vanilla Attack And Destroy binding - and the delays
+// below are milliseconds, not ticks: what the card shows is when the click goes out. Nothing waits
+// on the attack charge.
 struct AutoMaceSettings {
     bool stunSlam = false;         // axe first, then the mace, against a raised shield
-    // Click Simulation: the swing is MinecraftClient.doAttack() - the game's own Attack key - so the
-    // hit is exactly the click a player makes (one attack, one swing, the game's own crosshair pick
-    // and attack charge). Off sends the attack straight at the target instead, with no charge wait.
-    bool clickSimulation = true;
-    bool elytraSwap = true;        // elytra off for a carried chestplate before the smash
+    bool elytraSwap = true;        // the hotbar chestplate goes on (elytra off) before the smash
     bool swapBack = true;          // original hotbar slot back after the sequence
     float range = 3.f;             // blocks, as in Argon's REACH
     // Minimum Fall Height: a smash only arms while the player has fallen at least this many blocks,
     // because the mace's bonus damage is a function of the fall. 0 allows a smash from a standstill.
     float minFallHeight = 2.5f;    // blocks (0-20)
-    int hitDelayMinTicks = 0;      // random delay before the swing
-    int hitDelayMaxTicks = 2;
-    int cooldownMinTicks = 3;      // pause between sequences
-    int cooldownMaxTicks = 6;
-    int reswapMinTicks = 2;        // pause before the elytra goes back on
-    int reswapMaxTicks = 4;
-    int axeTicks = 2;              // StunSlam: spacer between the axe and the mace
-    int maceTicks = 2;             // ticks between selecting the mace and the smash
-    int swapTicks = 1;             // ticks a hotbar / chestplate swap is given
+    int hitDelayMinMs = 0;         // delay between the mace being in hand and the click
+    int hitDelayMaxMs = 60;
+    int cooldownMinMs = 120;       // pause between sequences
+    int cooldownMaxMs = 260;
+    int reswapMinMs = 80;          // pause before the elytra goes back on
+    int reswapMaxMs = 180;
+    int axeDelayMinMs = 100;       // StunSlam: the axe hit, then this long before the mace
+    int axeDelayMaxMs = 200;
+    int swapDelayMs = 50;          // a hotbar selection / chestplate equip is given this long
 };
 
 struct AimAssistSettings {

@@ -1,3 +1,25 @@
+# Passive - AutoMace rebuilt around the real Attack click, in milliseconds
+
+## AutoMace
+- **The whole card clicks now, and it clicks the real thing.** Click Simulation is not a setting any
+  more: every AutoMace swing is a left click posted to the game window, so the game handles it through
+  its own Attack And Destroy binding - its crosshair pick, its hand swing and the click a CPS HUD
+  counts. Triggerbot clicks the same way, so an attack from a card and an attack from the keyboard are
+  the same attack.
+- **No more waiting for the weapon's attack charge.** The sequence does exactly what the card says:
+  swap to the mace, then click at the configured **Hit delay**. StunSlam hits the shield with the
+  hotbar axe, waits the configured **Axe delay** - the time the shield needs to come down - then puts
+  the mace in and clicks at the Hit delay. Nothing waits for the attack speed to refill.
+- **Every delay is milliseconds.** Hit delay, Axe delay, Cooldown, Reswap and Swap delay are ms
+  sliders (the old per-tick sliders and the Reswap "ticks" labels are gone), and the engine paces on
+  the same millisecond values the sliders show.
+- **Elytra Swap works.** The chestplate in the hotbar is selected and put on with a vanilla right
+  click, which takes the elytra off in the same call - no inventory screen, and no menu clicks that
+  only ever worked while the player already had their inventory open. It runs in StunSlam too (after
+  the axe, before the mace), and the elytra is put back afterwards when it lands in the hotbar.
+- **The AutoAim step is gone from AutoMace.** The sequence no longer turns the camera onto the target
+  between the axe and the mace, so there is no choppy snap mid smash: it swaps, then clicks.
+
 # Passive - AutoMace Click Simulation, the StunSlam's mace hit, and a real uninject
 
 ## AutoMace / StunSlam

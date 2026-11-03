@@ -2553,6 +2553,32 @@ void updateAutoShieldBreak() {
     g_shieldWaiting=true;
 }
 
+// ---- the real click (Attack And Destroy) ---------------------------------------------------
+// Triggerbot and AutoMace click the way a player does: the left button is posted to the game window,
+// so the game handles it through its own Attack And Destroy binding - its crosshair pick, its
+// cooldown, its hand swing and the click a CPS HUD counts. Nothing is sent at an entity from here.
+// The press is held for a beat and released by clickAttackTick, because a press and a release inside
+// one frame read as no click at all (the same mechanism Drag Click and Triggerbot already use).
+bool   g_clickAttackDown = false;
+double g_clickAttackUpAt = 0.0;
+constexpr double kClickAttackHold = 0.025;
+
+void clickAttackRelease() {
+    if (!g_clickAttackDown) return;
+    hooks::syntheticClick(false);
+    g_clickAttackDown = false;
+}
+void clickAttackTick(double now) {
+    if (g_clickAttackDown && now >= g_clickAttackUpAt) clickAttackRelease();
+}
+bool clickAttackPress(double now) {
+    if (g_clickAttackDown) return false;          // the previous click is still held
+    hooks::syntheticClick(true);
+    g_clickAttackDown = true;
+    g_clickAttackUpAt = now + kClickAttackHold;
+    return true;
+}
+
 // ---- Triggerbot ---------------------------------------------------------------------------
 // A port of Argon's Trigger Bot: the card owns pacing and the target rules, and the swing itself is
 // the game's own attack (interactionManager.attackEntity - or a left click posted to the game window
@@ -2562,8 +2588,7 @@ std::string g_triggerLastTarget;       // Same Player: the target the last swing
 double g_triggerLastSwingAt = 0.0;
 int    g_triggerDelayMs = 0;           // the delay rolled for the current swing
 int    g_triggerDelayWeapon = -1;      // which weapon window g_triggerDelayMs came from
-bool   g_triggerClickDown = false;     // Click Simulation: a posted press waiting for its release
-double g_triggerClickReleaseAt = 0.0;
+
 
 // The rules themselves live in triggerbot_rules.h, where the harness can exercise them.
 int triggerRollDelay(trigger::Weapon weapon) {
@@ -2573,20 +2598,11 @@ int triggerRollDelay(trigger::Weapon weapon) {
     return trigger::rollDelay(lo, hi, (unsigned)std::rand());
 }
 
-// A posted click is let go whenever the card stops driving, so a disabled module never leaves the
-// left button pressed in the game window.
-void triggerReleaseClick() {
-    if (g_triggerClickDown) { hooks::syntheticClick(false); g_triggerClickDown = false; }
-}
-
 void updateTriggerbot() {
     const double now = ImGui::GetTime();
     const bool ready = jni::ready() && mc::frame::valid() && mc::frame::resolved() && mc::Client::player();
-    if (!g_triggerbot || !ready || gui::inputFrozen()) { triggerReleaseClick(); return; }
-    if (g_triggerClickDown && now >= g_triggerClickReleaseAt) {
-        hooks::syntheticClick(false);
-        g_triggerClickDown = false;
-    }
+    if (!g_triggerbot || !ready || gui::inputFrozen()) { clickAttackRelease(); return; }
+    clickAttackTick(now);
 
     const TriggerbotSettings& st = g_triggerbotSettings;
     if (g_attackSentThisFrame) return;                     // another module already swung this frame
@@ -2645,22 +2661,9 @@ void updateTriggerbot() {
     if (st.criticals == CritMode::PrioCrit && !crit &&
         now - g_triggerLastSwingAt < (g_triggerDelayMs / 1000.0) * 2.0) return;
 
-    bool attacked = false;
-    if (st.clickSimulation) {
-        // The click is posted to the game window, so the game performs its own attack and its own
-        // click bookkeeping (a CPS HUD included) sees a real press. It is held for a beat because a
-        // press and a release inside one frame read as no click at all.
-        if (!g_triggerClickDown) {
-            hooks::syntheticClick(true);
-            g_triggerClickDown = true;
-            g_triggerClickReleaseAt = now + 0.02;
-            attacked = true;
-        }
-    } else {
-        attacked = mc::Client::attackEntity(target.get());
-        if (attacked) local.swingHand();
-    }
-    if (!attacked) return;
+    // The swing is a real left click posted to the game window, so the game makes the attack itself
+    // through its own Attack And Destroy binding. A press already in flight is this frame's click.
+    if (!clickAttackPress(now)) return;
 
     // The swing is announced, so Auto Shield Break's OnHit mode answers it exactly as it answers a
     // real click (and Auto Shield's swing trigger can do the same).
@@ -2672,126 +2675,36 @@ void updateTriggerbot() {
 }
 
 // ---- AutoMace -----------------------------------------------------------------------------
-// Argon's AutoMace, native. Crosshair on a player inside reach: put the mace in hand, swing on a
-// random delay and give the elytra back. StunSlam opens the same sequence with the hotbar axe so a
-// raised shield is dropped before the mace lands. Every swing is announced through noteModuleSwing,
-// which keeps Auto Shield Break's OnHit mode (and the shield follow-ups) in step with it.
-enum class MacePhase { Idle, AxeSwap, AxeWind, ChestOff, MaceSelect, MaceWind, Restore, Cooldown };
-MacePhase g_macePhase = MacePhase::Idle;
-double g_maceStageAt = 0.0;
-double g_maceNextAt = 0.0;
-double g_maceSwingDeadline = 0.0;   // a refused swing is retried until then, then the sequence ends
-std::string g_maceTarget;
-int  g_maceOrigSlot = -1;
-bool g_maceChestSwapped = false;
-bool g_maceAxeRetried = false;
-constexpr double kMaceTick = 0.05;          // one game tick, in the overlay's clock
-// How long one swing step may wait for the game to be able to attack: an axe hit empties the attack
-// charge and the mace refills it in about a second and a half, while the axe's shield disable lasts
-// five - so this stays inside the window a stun slam has without leaving a step open forever.
-constexpr double kMaceSwingWait = 2.5;
-
-// ---- the swing (Click Simulation) ----------------------------------------------------------
-// Defined with the V2 engine further down: the crosshair test and the aim are the same rules V2
-// swings by, so the two engines cannot disagree about what "on the target" means.
-bool maceV2AimAt(mc::Player& player, jobject targetObj);
-bool maceV2CrosshairOn(jobject targetObj, const mc::Player& player, float maxDistance);
-
-enum class MaceSwingResult { Sent, Aimed, Waiting, Failed };
-
-// Is `id` the item in the player's main hand right now? The mace step must never swing the axe it
-// swapped away from - which on screen is exactly "the shield was stunned but no mace hit landed".
-bool maceHolding(jobject playerObj, const char* id) {
-    if (!playerObj) return false;
-    mc::LocalRef hand(mc::LivingEntity(playerObj).mainHandStack());
-    return hand && mc::stk::itemId(hand.get()) == id;
-}
-
-// Is the game ready to make an attack? doAttack() only sends one while the attack charge is full,
-// and after a stun slam's axe hit the charge is empty - the wait the old engine never made.
-bool maceSwingCharged(mc::Player& player) {
-    if (mc::Client::attackCooldown() > 0) return false;
-    return player.attackCooldownProgress(1.f) >= 0.9f;
-}
-
-// The game's own crosshair pick is this target. The pick is refreshed on the game's tick, so a frame
-// that has only just aimed still reads the previous hit; the ray test against the current view covers
-// that window (the same test V2 swings by).
-bool maceCrosshairOn(jobject targetObj, mc::Player& player, float range) {
-    if (!targetObj) return false;
-    JNIEnv* env = jni::env();
-    if (!env) return false;
-    mc::LocalRef hit(mc::Client::crosshair());
-    if (hit && mc::hit::typeOf(hit.get()) == 2) {
-        mc::LocalRef picked(mc::hit::entity(hit.get()));
-        const bool same = picked && env->IsSameObject(picked.get(), targetObj) == JNI_TRUE;
-        jni::clearException(env, "automace crosshair compare");
-        if (!same) return false;        // doAttack() would attack whatever this is instead
-        return true;
-    }
-    // A block in front of the target is what doAttack() would mine instead, so the ray fallback only
-    // stands while the game's own pick is not a block.
-    if (hit && mc::hit::typeOf(hit.get()) == 1) return false;
-    return maceV2CrosshairOn(targetObj, player, range);
-}
-
-// One swing at the tracked target, made the way a player makes it.
+// A smash, not a combo. The sequence only arms while the player is falling at least Minimum Fall
+// Height - the mace's damage is a function of the fall - then takes the mace out of the hotbar and
+// clicks once at the configured Hit delay.
 //
-// Click Simulation (the default) is MinecraftClient.doAttack(): the game re-picks its crosshair, checks
-// its own attack charge, attacks, swings the hand and sends the packets - one attack + one swing, and
-// nothing a real click would not send. The game can refuse it (charge empty, or the target knocked a
-// few degrees off the crosshair by the axe), so the step is retried instead of skipped: Aimed turned
-// the view onto the target and Waiting is the charge refilling, both mean "the same step next frame".
-// Failed only appears once the wait ran out, so a swing that never becomes possible cannot loop.
-MaceSwingResult maceTrySwing(mc::Player& player, jobject targetObj, bool requireMace, float range,
-                             double now) {
-    jobject playerObj = mc::Client::player();
-    if (!targetObj || !playerObj) return MaceSwingResult::Failed;
+// Every click is the game's own Attack And Destroy key pressed through the vanilla binding, so
+// MinecraftClient runs its own attack: its crosshair pick, its hand swing and the click a CPS HUD
+// counts. Nothing here sends an attack at the entity, and nothing waits for the attack charge - the
+// delays on the card are the whole timing, so a hit lands when the card says it does.
+//
+// StunSlam puts the hotbar axe in front of the same smash: a raised shield is hit with the axe,
+// then, after the configured Axe delay (the time the shield needs to come down), the mace goes in
+// and the click goes out at the Hit delay.
+enum class MacePhase { Idle, AxeSwing, AxeWait, ChestOff, ChestEquip, MaceSelect, MaceSwing, Restore, Cooldown };
 
-    // Click Simulation off: the interaction manager's attack straight at the tracked entity, with the
-    // hand swing sent by us. No charge gate, so it always goes out.
-    if (!g_autoMaceSettings.clickSimulation) {
-        if (!mc::Client::attackEntity(targetObj)) return MaceSwingResult::Failed;
-        player.swingHand();
-        noteModuleSwing(now);
-        return MaceSwingResult::Sent;
-    }
+MacePhase g_macePhase = MacePhase::Idle;
+double g_maceStageAt = 0.0;       // when the current step may continue
+double g_maceNextAt = 0.0;        // when the next sequence may arm
+std::string g_maceTarget;         // UUID of the entity the sequence was armed on
+int  g_maceOrigSlot = -1;         // hotbar slot to give back afterwards
+bool g_maceChestSwapped = false;  // the chestplate went on, so the elytra has to come back
+int  g_maceHitDelayMs = 0;        // the hit delay rolled for this smash
 
-    if (g_maceSwingDeadline <= 0.0) g_maceSwingDeadline = now + kMaceSwingWait;
-    const bool expired = now >= g_maceSwingDeadline;
-
-    if (requireMace && !maceHolding(playerObj, "mace"))
-        return expired ? MaceSwingResult::Failed : MaceSwingResult::Waiting;
-
-    // doAttack() would hit whatever else the crosshair points at (a block included), so the target has
-    // to be the pick before the click goes out. Aiming back onto it is what makes the swing land after
-    // the axe's knockback moved it.
-    if (!maceCrosshairOn(targetObj, player, range)) {
-        if (expired) return MaceSwingResult::Failed;
-        maceV2AimAt(player, targetObj);
-        g_maceStageAt = now + kMaceTick;      // one game tick for the game to re-pick
-        return MaceSwingResult::Aimed;
-    }
-
-    if (!maceSwingCharged(player) || !mc::Client::doAttack()) {
-        if (expired) return MaceSwingResult::Failed;
-        g_maceStageAt = now + kMaceTick * 0.5;   // the charge refills on the game's tick
-        return MaceSwingResult::Waiting;
-    }
-
-    // The game made the attack and swung the hand itself, so there is no second swing here. Every
-    // follow-up that answers a swing (Auto Shield Break's OnHit mode) is told about it instead.
-    noteModuleSwing(now);
-    g_maceSwingDeadline = 0.0;
-    return MaceSwingResult::Sent;
-}
-
-int maceRandTicks(int lo, int hi) {
-    lo = std::clamp(lo, 0, 40); hi = std::clamp(hi, 0, 40);
+int maceRandMs(int lo, int hi) {
+    lo = std::clamp(lo, 0, 5000); hi = std::clamp(hi, 0, 5000);
     if (hi < lo) std::swap(lo, hi);
     if (hi <= lo) return lo;
     return lo + (int)(std::rand() % (hi - lo + 1));
 }
+
+double maceSeconds(int ms) { return std::max(0, ms) / 1000.0; }
 
 std::string maceItemId(jobject list, int index) {
     mc::LocalRef stack(mc::inv::getFromList(list, index));
@@ -2804,52 +2717,54 @@ int maceFindHotbar(jobject list, const char* id) {
     return -1;
 }
 
-int maceFindHotbarAxe(jobject list) {
+// The first hotbar slot whose item id ends in "suffix" ("_axe", "_chestplate").
+int maceFindHotbarEnding(jobject list, const char* suffix) {
+    const std::string want(suffix);
     const int count = std::min(9, mc::inv::listSize(list));
     for (int i = 0; i < count; ++i) {
         const std::string id = maceItemId(list, i);
-        if (id.size() >= 4 && id.compare(id.size() - 4, 4, "_axe") == 0) return i;
+        if (id.size() >= want.size() && id.compare(id.size() - want.size(), want.size(), want) == 0)
+            return i;
     }
     return -1;
 }
+int maceFindHotbarAxe(jobject list)        { return maceFindHotbarEnding(list, "_axe"); }
+int maceFindHotbarChestplate(jobject list) { return maceFindHotbarEnding(list, "_chestplate"); }
 
-// A carried chestplate (any tier) or the elytra, as a PlayerInventory main-list index.
-int maceFindInventory(jobject list, bool chestplate) {
-    const int count = std::min(36, mc::inv::listSize(list));
-    for (int i = 0; i < count; ++i) {
-        const std::string id = maceItemId(list, i);
-        if (id.empty()) continue;
-        if (chestplate) {
-            if (id.size() >= 12 && id.compare(id.size() - 12, 12, "_chestplate") == 0) return i;
-        } else if (id == "elytra") return i;
-    }
-    return -1;
+bool maceHolding(jobject playerObj, const char* id) {
+    if (!playerObj) return false;
+    mc::LocalRef hand(mc::LivingEntity(playerObj).mainHandStack());
+    return hand && mc::stk::itemId(hand.get()) == id;
 }
 
-bool maceWearingElytra(mc::LivingEntity& self) {
-    mc::LocalRef chest(self.equippedStack(4));   // EquipmentSlot order: 4 = CHEST
-    return chest && mc::stk::itemId(chest.get()) == "elytra";
+// Is the main hand the item that sits in `slot` right now? A hotbar selection that did not take is
+// retried rather than clicking with the item it was meant to replace (the axe, after a stun slam).
+bool maceHoldingSlotItem(jobject list, jobject playerObj, int slot) {
+    const std::string want = maceItemId(list, slot);
+    return !want.empty() && maceHolding(playerObj, want.c_str());
 }
 
-// Three ordinary left clicks move a stack between an inventory index and the chest armour slot
-// (menu slot 6): pick the chestplate up, click the armour slot (the elytra ends up on the cursor),
-// click the inventory index again (the elytra goes back where the plate was). The same call puts
-// the elytra back on afterwards.
-bool maceSwapChest(jobject inventory, int index) {
-    if (!inventory || index < 0 || !mc::Client::playerScreenIsCurrent()) return false;
-    const int screenSlot = mc::Client::playerScreenSlotForMainIndex(index);
-    if (screenSlot < 0) return false;
-    if (!mc::Client::pickupSlot(screenSlot)) return false;
-    if (!mc::Client::pickupSlot(6)) return false;
-    mc::Client::pickupSlot(screenSlot);
-    return true;
+bool maceWearing(jobject playerObj, const char* id) {
+    if (!playerObj) return false;
+    mc::LocalRef chest(mc::LivingEntity(playerObj).equippedStack(4));   // 4 = CHEST
+    return chest && mc::stk::itemId(chest.get()) == id;
+}
+
+// Put the stack in the hand on the way a right click does. For a chestplate that is the whole Elytra
+// Swap: the vanilla call takes the elytra off as it puts the plate on - no screen, no menu clicks.
+bool maceEquipHeld(jobject playerObj, const char* id) {
+    if (!maceHolding(playerObj, id)) return false;
+    mc::Client::interactItem(false);
+    return maceWearing(playerObj, id);
 }
 
 void maceRestoreSlot() {
     const int slot = g_maceOrigSlot;
     g_maceOrigSlot = -1;
     if (!g_autoMaceSettings.swapBack || slot < 0 || slot > 8) return;
-    mc::LocalRef inventory(mc::Player(mc::Client::player()).inventory());
+    jobject playerObj = mc::Client::player();
+    if (!playerObj) return;
+    mc::LocalRef inventory(mc::Player(playerObj).inventory());
     if (!inventory) return;
     const int current = std::clamp(mc::inv::selectedSlot(inventory.get()), 0, 8);
     if (current != slot) selectSlot(inventory.get(), slot);
@@ -2859,29 +2774,37 @@ void maceResetState(bool restore) {
     if (restore) {
         maceRestoreSlot();
         if (g_maceChestSwapped) {
-            mc::LocalRef inventory(mc::Player(mc::Client::player()).inventory());
+            jobject playerObj = mc::Client::player();
+            mc::LocalRef inventory(playerObj ? mc::Player(playerObj).inventory() : nullptr);
             mc::LocalRef list(inventory ? mc::inv::mainList(inventory.get()) : nullptr);
-            const int elytra = list ? maceFindInventory(list.get(), false) : -1;
-            if (elytra >= 0) maceSwapChest(inventory.get(), elytra);
+            const int elytra = list ? maceFindHotbar(list.get(), "elytra") : -1;
+            // The elytra went into the inventory when the plate went on. Put it back on if it landed
+            // in the hotbar; otherwise the plate stays on rather than a screen opening mid fight.
+            if (elytra >= 0 && playerObj) {
+                selectSlot(inventory.get(), elytra);
+                maceEquipHeld(playerObj, "elytra");
+            }
+            g_maceChestSwapped = false;
         }
     }
     g_macePhase = MacePhase::Idle;
-    g_maceTarget.clear();
-    g_maceChestSwapped = false;
-    g_maceAxeRetried = false;
     g_maceStageAt = 0.0;
-    g_maceSwingDeadline = 0.0;
+    g_maceTarget.clear();
+    g_maceHitDelayMs = 0;
+    g_maceOrigSlot = -1;
+    g_maceChestSwapped = false;
 }
 
 void updateAutoMace() {
     const double now = ImGui::GetTime();
+    clickAttackTick(now);
     const bool ready = jni::ready() && mc::frame::valid() && mc::frame::resolved() && mc::Client::player();
     if (!g_autoMace || !ready || gui::inputFrozen()) {
         if (g_macePhase != MacePhase::Idle) maceResetState(true);
+        clickAttackRelease();
         return;
     }
-    // A screen pauses the sequence where it is: the swaps need the player's own handler on screen,
-    // and Argon leaves the card alone while a screen is open rather than cancelling a smash.
+    // A screen pauses the sequence where it is; the card does not cancel a smash for it.
     if (mc::Client::screenOpen()) return;
 
     const AutoMaceSettings& st = g_autoMaceSettings;
@@ -2903,8 +2826,8 @@ void updateAutoMace() {
     switch (g_macePhase) {
         case MacePhase::Idle: {
             if (now < g_maceNextAt) return;
-            // Minimum Fall Height: the mace's whole point is the fall bonus, so the sequence does
-            // not even arm until the player has fallen that far. 0 keeps the old ground-level use.
+            // Minimum Fall Height: the mace's damage is a function of the fall, so the sequence does
+            // not arm until the player is falling that far. 0 keeps the ground-level use.
             if (st.minFallHeight > 0.01f &&
                 (local.onGround() || local.fallDistance() < st.minFallHeight)) return;
             mc::LocalRef crosshair(mc::Client::crosshair());
@@ -2914,114 +2837,118 @@ void updateAutoMace() {
             if (!isPlayerEntity(jni::env(), target.get())) return;
             if (entityBlocked(target.get(), true)) return;
             if ((mc::Entity(target.get()).pos() - local.pos()).len() > st.range) return;
-            if (maceFindHotbar(list.get(), "mace") < 0) return;
+            const int mace = maceFindHotbar(list.get(), "mace");
+            if (mace < 0) return;
             const std::string key = trackedTargetKey(target.get());
             if (key.empty()) return;
             g_maceTarget = key;
             g_maceOrigSlot = std::clamp(mc::inv::selectedSlot(inventory.get()), 0, 8);
-            g_maceAxeRetried = false;
-            g_maceSwingDeadline = 0.0;      // every step of the slam gets its own swing window
+            g_maceChestSwapped = false;
+            g_maceHitDelayMs = 0;
             const int axe = maceFindHotbarAxe(list.get());
             if (st.stunSlam && axe >= 0 && mc::LivingEntity(target.get()).blocking()) {
                 selectSlot(inventory.get(), axe);
-                g_macePhase = MacePhase::AxeSwap;
-                g_maceStageAt = now + std::max(1, st.swapTicks) * kMaceTick;
+                g_macePhase = MacePhase::AxeSwing;
+                g_maceStageAt = now + maceSeconds(st.swapDelayMs);
                 return;
             }
             g_macePhase = MacePhase::ChestOff;
             g_maceStageAt = now;
             return;
         }
-        case MacePhase::AxeSwap: {
+        case MacePhase::AxeSwing: {
             if (now < g_maceStageAt) return;
             mc::LocalRef target = targetAlive(0.5f);
             if (!target) { maceResetState(true); return; }
-            // The stun hit is the game's own click too, so it waits for what the game needs (the
-            // charge, the crosshair) instead of being skipped - a stun slam whose axe is skipped has
-            // nothing left to break the shield with.
-            const MaceSwingResult swing = maceTrySwing(local, target.get(), false, st.range + 0.5f, now);
-            if (swing == MaceSwingResult::Sent) {
-                g_macePhase = MacePhase::AxeWind;
-                g_maceStageAt = now + std::max(0, st.axeTicks) * kMaceTick;
-            } else if (swing == MaceSwingResult::Failed) {
-                maceResetState(true);       // the axe never became possible: do not stun half way
-            }
-            return;
-        }
-        case MacePhase::AxeWind: {
-            if (now < g_maceStageAt) return;
-            mc::LocalRef target = targetAlive(0.5f);
-            if (!target) { maceResetState(true); return; }
-            // One retry while the shield is still up, then the mace takes over.
-            if (!g_maceAxeRetried && mc::LivingEntity(target.get()).blocking()) {
-                g_maceAxeRetried = true;
-                g_maceSwingDeadline = 0.0;
-                g_maceStageAt = now;
-                g_macePhase = MacePhase::AxeSwap;   // the axe step again, with a fresh swing window
+            const int axe = maceFindHotbarAxe(list.get());
+            if (axe < 0) { maceResetState(true); return; }
+            if (!maceHoldingSlotItem(list.get(), playerObj, axe)) {
+                selectSlot(inventory.get(), axe);          // the selection did not take: retry it
+                g_maceStageAt = now + maceSeconds(st.swapDelayMs);
                 return;
             }
+            if (!clickAttackPress(now)) return;
+            noteModuleSwing(now);
+            g_macePhase = MacePhase::AxeWait;
+            g_maceStageAt = now + maceSeconds(maceRandMs(st.axeDelayMinMs, st.axeDelayMaxMs));
+            return;
+        }
+        case MacePhase::AxeWait: {
+            if (now < g_maceStageAt) return;
+            mc::LocalRef target = targetAlive(0.5f);
+            if (!target) { maceResetState(true); return; }
             g_macePhase = MacePhase::ChestOff;
             g_maceStageAt = now;
             return;
         }
         case MacePhase::ChestOff: {
             if (now < g_maceStageAt) return;
-            if (st.elytraSwap && maceWearingElytra(local)) {
-                const int plate = maceFindInventory(list.get(), true);
-                if (plate >= 0 && maceSwapChest(inventory.get(), plate)) g_maceChestSwapped = true;
+            if (st.elytraSwap && maceWearing(playerObj, "elytra")) {
+                const int plate = maceFindHotbarChestplate(list.get());
+                if (plate >= 0) {
+                    selectSlot(inventory.get(), plate);
+                    g_macePhase = MacePhase::ChestEquip;
+                    g_maceStageAt = now + maceSeconds(st.swapDelayMs);
+                    return;
+                }
             }
             const int mace = maceFindHotbar(list.get(), "mace");
             if (mace < 0) { maceResetState(true); return; }
             selectSlot(inventory.get(), mace);
             g_macePhase = MacePhase::MaceSelect;
-            g_maceStageAt = now + std::max(1, st.swapTicks) * kMaceTick;
+            g_maceStageAt = now + maceSeconds(st.swapDelayMs);
+            return;
+        }
+        case MacePhase::ChestEquip: {
+            if (now < g_maceStageAt) return;
+            const int plate = maceFindHotbarChestplate(list.get());
+            if (plate >= 0 && maceHoldingSlotItem(list.get(), playerObj, plate)) {
+                const std::string id = maceItemId(list, plate);
+                if (!id.empty() && maceEquipHeld(playerObj, id.c_str())) g_maceChestSwapped = true;
+            }
+            const int mace = maceFindHotbar(list.get(), "mace");
+            if (mace < 0) { maceResetState(true); return; }
+            selectSlot(inventory.get(), mace);
+            g_macePhase = MacePhase::MaceSelect;
+            g_maceStageAt = now + maceSeconds(st.swapDelayMs);
             return;
         }
         case MacePhase::MaceSelect: {
             if (now < g_maceStageAt) return;
-            g_macePhase = MacePhase::MaceWind;
-            g_maceStageAt = now + (std::max(0, st.maceTicks) +
-                                   maceRandTicks(st.hitDelayMinTicks, st.hitDelayMaxTicks)) * kMaceTick;
+            const int mace = maceFindHotbar(list.get(), "mace");
+            if (mace < 0) { maceResetState(true); return; }
+            if (!maceHoldingSlotItem(list.get(), playerObj, mace)) {
+                selectSlot(inventory.get(), mace);
+                g_maceStageAt = now + maceSeconds(st.swapDelayMs);
+                return;
+            }
+            g_maceHitDelayMs = maceRandMs(st.hitDelayMinMs, st.hitDelayMaxMs);
+            g_macePhase = MacePhase::MaceSwing;
+            g_maceStageAt = now + maceSeconds(g_maceHitDelayMs);
             return;
         }
-        case MacePhase::MaceWind: {
+        case MacePhase::MaceSwing: {
             if (now < g_maceStageAt) return;
-            // The fall is read once, when the sequence ARMS (see Idle), and never again here. The axe
-            // hit and the wait for the attack charge both spend the fall, and re-testing it here is
-            // what ended every stun slam after the shield was already down: the player lands a few
-            // ticks after the axe, the mace step then saw ground and cancelled - "it stuns the shield
-            // but never hits with the mace". Arming still needs the fall, which is the part that
-            // decides whether this is a smash at all.
             mc::LocalRef target = targetAlive(0.5f);
             if (!target) { maceResetState(true); return; }
             const int mace = maceFindHotbar(list.get(), "mace");
             if (mace < 0) { maceResetState(true); return; }
-            if (!maceHolding(playerObj, "mace")) {
-                // The hotbar selection did not take: put the mace back in hand and give it its tick
-                // instead of swinging whatever is there now (the axe, after a stun slam).
-                selectSlot(inventory.get(), mace);
-                g_maceStageAt = now + std::max(1, st.swapTicks) * kMaceTick;
+            if (!maceHoldingSlotItem(list.get(), playerObj, mace)) {
+                g_macePhase = MacePhase::MaceSelect;     // the mace is not in hand: go and get it
+                g_maceStageAt = now + maceSeconds(st.swapDelayMs);
                 return;
             }
-            const MaceSwingResult swing = maceTrySwing(local, target.get(), true, st.range + 0.5f, now);
-            if (swing != MaceSwingResult::Sent) {
-                if (swing == MaceSwingResult::Failed) maceResetState(true);
-                return;                     // Aimed / Waiting: the same step runs again next frame
-            }
+            if (!clickAttackPress(now)) return;
+            noteModuleSwing(now);
             g_macePhase = MacePhase::Restore;
-            g_maceStageAt = now + maceRandTicks(st.reswapMinTicks, st.reswapMaxTicks) * kMaceTick;
+            g_maceStageAt = now + maceSeconds(maceRandMs(st.reswapMinMs, st.reswapMaxMs));
             return;
         }
         case MacePhase::Restore: {
             if (now < g_maceStageAt) return;
-            if (g_maceChestSwapped) {
-                const int elytra = maceFindInventory(list.get(), false);
-                if (elytra >= 0) maceSwapChest(inventory.get(), elytra);
-                g_maceChestSwapped = false;
-            }
-            maceRestoreSlot();
+            maceResetState(true);
             g_macePhase = MacePhase::Cooldown;
-            g_maceNextAt = now + maceRandTicks(st.cooldownMinTicks, st.cooldownMaxTicks) * kMaceTick;
+            g_maceNextAt = now + maceSeconds(maceRandMs(st.cooldownMinMs, st.cooldownMaxMs));
             return;
         }
         case MacePhase::Cooldown: {
@@ -3142,7 +3069,7 @@ bool playerAttackInputHeld() {
 
 // The target captured when the sequence started is tracked by UUID (see targetAlive inside
 // updateAutoMace), so swapping to a shorter-reach item - which changes the crosshair pick - can no
-// longer make the module drop the target mid stun-slam / smash. The swing itself is maceTrySwing.
+// longer make the module drop the target mid stun-slam / smash. The swing itself is clickAttackPress.
 
 
 // ---- AimAssist ----------------------------------------------------------------------------
@@ -7246,9 +7173,10 @@ void resetDefaults() {
     g_triggerbot=false; g_triggerbotKey=0; g_triggerbotSettings=TriggerbotSettings{};
     g_autoMace=false; g_autoMaceKey=0; g_autoMaceSettings=AutoMaceSettings{};
     g_macePhase=MacePhase::Idle; g_maceStageAt=0.0; g_maceNextAt=0.0; g_maceTarget.clear();
-    g_maceOrigSlot=-1; g_maceChestSwapped=false; g_maceAxeRetried=false;
+    g_maceOrigSlot=-1; g_maceChestSwapped=false; g_maceHitDelayMs=0;
+    clickAttackRelease();
     g_triggerLastTarget.clear(); g_triggerLastSwingAt=0.0; g_triggerDelayMs=0; g_triggerDelayWeapon=-1;
-    g_triggerClickDown=false; g_triggerClickReleaseAt=0.0;
+    clickAttackRelease();   // never leave the Attack key held when the cards are reset
     g_moduleSwingSeq=0; g_shieldConsumedSwingSeq=0; g_moduleSwingAt=-1000.0;
     g_autoShieldBreakKey=0; g_autoBucketDrainKey=0; g_autoPressurePlateWebKey=0;
     g_antiBotSettings=AntiBotSettings{}; g_nametagsSettings=NametagsSettings{};
@@ -7409,24 +7337,23 @@ std::string serialize() {
         {"axeDelayMinMs",g_triggerbotSettings.axeDelayMinMs},
         {"axeDelayMaxMs",g_triggerbotSettings.axeDelayMaxMs},
         {"checkShield",g_triggerbotSettings.checkShield},
-        {"clickSimulation",g_triggerbotSettings.clickSimulation},
         {"strayBypass",g_triggerbotSettings.strayBypass},
         {"allEntities",g_triggerbotSettings.allEntities},
         {"samePlayer",g_triggerbotSettings.samePlayer},
         {"criticals",(int)g_triggerbotSettings.criticals}};
     j["autoMace"]={{"stunSlam",g_autoMaceSettings.stunSlam},
-        {"clickSimulation",g_autoMaceSettings.clickSimulation},
         {"elytraSwap",g_autoMaceSettings.elytraSwap},
         {"swapBack",g_autoMaceSettings.swapBack},{"range",g_autoMaceSettings.range},
         {"minFallHeight",g_autoMaceSettings.minFallHeight},
-        {"hitDelayMinTicks",g_autoMaceSettings.hitDelayMinTicks},
-        {"hitDelayMaxTicks",g_autoMaceSettings.hitDelayMaxTicks},
-        {"cooldownMinTicks",g_autoMaceSettings.cooldownMinTicks},
-        {"cooldownMaxTicks",g_autoMaceSettings.cooldownMaxTicks},
-        {"reswapMinTicks",g_autoMaceSettings.reswapMinTicks},
-        {"reswapMaxTicks",g_autoMaceSettings.reswapMaxTicks},
-        {"axeTicks",g_autoMaceSettings.axeTicks},{"maceTicks",g_autoMaceSettings.maceTicks},
-        {"swapTicks",g_autoMaceSettings.swapTicks}};
+        {"hitDelayMinMs",g_autoMaceSettings.hitDelayMinMs},
+        {"hitDelayMaxMs",g_autoMaceSettings.hitDelayMaxMs},
+        {"cooldownMinMs",g_autoMaceSettings.cooldownMinMs},
+        {"cooldownMaxMs",g_autoMaceSettings.cooldownMaxMs},
+        {"reswapMinMs",g_autoMaceSettings.reswapMinMs},
+        {"reswapMaxMs",g_autoMaceSettings.reswapMaxMs},
+        {"axeDelayMinMs",g_autoMaceSettings.axeDelayMinMs},
+        {"axeDelayMaxMs",g_autoMaceSettings.axeDelayMaxMs},
+        {"swapDelayMs",g_autoMaceSettings.swapDelayMs}};
     j["aimAssist"]={{"allowPlayers",g_aimAssistSettings.allowPlayers},{"allowEntities",g_aimAssistSettings.allowEntities},
         {"range",g_aimAssistSettings.range},{"fov",g_aimAssistSettings.fov},{"speed",g_aimAssistSettings.speed},
         {"vertical",g_aimAssistSettings.vertical},{"onlyWhileAttacking",g_aimAssistSettings.onlyWhileAttacking},
@@ -7597,27 +7524,25 @@ bool deserialize(const std::string& jsonText) {
         g_triggerbotSettings.axeDelayMinMs=std::clamp(tb.value("axeDelayMinMs",780),0,1000);
         g_triggerbotSettings.axeDelayMaxMs=std::clamp(tb.value("axeDelayMaxMs",800),0,1000);
         g_triggerbotSettings.checkShield=tb.value("checkShield",false);
-        g_triggerbotSettings.clickSimulation=tb.value("clickSimulation",false);
         g_triggerbotSettings.strayBypass=tb.value("strayBypass",false);
         g_triggerbotSettings.allEntities=tb.value("allEntities",false);
         g_triggerbotSettings.samePlayer=tb.value("samePlayer",false);
         g_triggerbotSettings.criticals=(CritMode)std::clamp(tb.value("criticals",0),0,2);
         const auto am=j.value("autoMace",nlohmann::json::object());
         g_autoMaceSettings.stunSlam=am.value("stunSlam",false);
-        g_autoMaceSettings.clickSimulation=am.value("clickSimulation",true);
         g_autoMaceSettings.elytraSwap=am.value("elytraSwap",true);
         g_autoMaceSettings.swapBack=am.value("swapBack",true);
         g_autoMaceSettings.range=std::clamp(am.value("range",3.f),1.f,6.f);
         g_autoMaceSettings.minFallHeight=std::clamp(am.value("minFallHeight",2.5f),0.f,20.f);
-        g_autoMaceSettings.hitDelayMinTicks=std::clamp(am.value("hitDelayMinTicks",0),0,20);
-        g_autoMaceSettings.hitDelayMaxTicks=std::clamp(am.value("hitDelayMaxTicks",2),0,20);
-        g_autoMaceSettings.cooldownMinTicks=std::clamp(am.value("cooldownMinTicks",3),0,40);
-        g_autoMaceSettings.cooldownMaxTicks=std::clamp(am.value("cooldownMaxTicks",6),0,40);
-        g_autoMaceSettings.reswapMinTicks=std::clamp(am.value("reswapMinTicks",2),0,40);
-        g_autoMaceSettings.reswapMaxTicks=std::clamp(am.value("reswapMaxTicks",4),0,40);
-        g_autoMaceSettings.axeTicks=std::clamp(am.value("axeTicks",2),0,20);
-        g_autoMaceSettings.maceTicks=std::clamp(am.value("maceTicks",2),0,20);
-        g_autoMaceSettings.swapTicks=std::clamp(am.value("swapTicks",1),0,20);
+        g_autoMaceSettings.hitDelayMinMs=std::clamp(am.value("hitDelayMinMs",0),0,500);
+        g_autoMaceSettings.hitDelayMaxMs=std::clamp(am.value("hitDelayMaxMs",60),0,500);
+        g_autoMaceSettings.cooldownMinMs=std::clamp(am.value("cooldownMinMs",120),0,1000);
+        g_autoMaceSettings.cooldownMaxMs=std::clamp(am.value("cooldownMaxMs",260),0,1000);
+        g_autoMaceSettings.reswapMinMs=std::clamp(am.value("reswapMinMs",80),0,1000);
+        g_autoMaceSettings.reswapMaxMs=std::clamp(am.value("reswapMaxMs",180),0,1000);
+        g_autoMaceSettings.axeDelayMinMs=std::clamp(am.value("axeDelayMinMs",100),0,500);
+        g_autoMaceSettings.axeDelayMaxMs=std::clamp(am.value("axeDelayMaxMs",200),0,500);
+        g_autoMaceSettings.swapDelayMs=std::clamp(am.value("swapDelayMs",50),0,300);
         const auto b=j.value("autoBucketDrain",nlohmann::json::object());
         g_autoBucketDrainSettings.ignoreOwnWater=b.value("ignoreOwnWater",true);
         g_autoBucketDrainSettings.swapBack=b.value("swapBack",true);
