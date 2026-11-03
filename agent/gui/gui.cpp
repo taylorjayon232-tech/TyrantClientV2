@@ -1368,6 +1368,7 @@ float moduleCardHeight(const char* name,bool expanded) {
     if (module=="Sprint") return 150.f;
     if (module=="Auto Jump Reset") return 190.f;
     if (module=="AimAssist") return 520.f;
+    if (module=="Silent Aim") return 500.f;
     if (module=="Triggerbot") return 370.f;
     if (module=="AutoMace") return 468.f;
     if (module=="Anti-Bot") return 190.f;
@@ -2198,6 +2199,37 @@ void drawModuleCards(ImDrawList* dl, ImVec2 origin, float scale, float opacity,
                 ImGui::PopID();
                 drawText(dl,origin,pageX+20.f,cardY+460.f,"Center aims at the body, Head at the head, Loose anywhere in the hitbox.",kDim,8.f,scale,opacity);
                 drawModuleKeybind(dl,origin,*entry,pageX+20.f,cardY+484.f,pageW-40.f,scale,opacity);
+            } else if (expanded && std::string(entry->name)=="Silent Aim") {
+                modules::SilentAimSettings& settings=modules::silentAimModuleSettings();
+                ImGui::PushID("silent-aim-options");
+                setWidgetCursor(pageX+20.f,cardY+77.f,scale); ui::Checkbox("Target players",&settings.allowPlayers);
+                setWidgetCursor(pageX+20.f,cardY+107.f,scale); ui::Checkbox("Target entities",&settings.allowEntities);
+                drawSlider(dl,origin,"silent-aim-range","Range (blocks)","",pageX+20.f,cardY+137.f,pageW-40.f,scale,opacity,settings.range,1.f,12.f);
+                drawSlider(dl,origin,"silent-aim-fov","FOV (degrees)","",pageX+20.f,cardY+174.f,pageW-40.f,scale,opacity,settings.fov,10.f,360.f);
+                drawSlider(dl,origin,"silent-aim-speed","Smoothing speed","",pageX+20.f,cardY+211.f,pageW-40.f,scale,opacity,settings.speed,1.f,40.f);
+                setWidgetCursor(pageX+20.f,cardY+248.f,scale); ui::Checkbox("Smooth tracking (sweep, do not snap)",&settings.smooth);
+                setWidgetCursor(pageX+20.f,cardY+278.f,scale); ui::Checkbox("Vertical aim",&settings.vertical);
+                setWidgetCursor(pageX+20.f,cardY+308.f,scale); ui::Checkbox("Only while holding attack",&settings.onlyWhileAttacking);
+                setWidgetCursor(pageX+20.f,cardY+338.f,scale); ui::Checkbox("No Glide (off while an elytra is gliding)",&settings.noGlide);
+                drawText(dl,origin,pageX+20.f,cardY+374.f,"ACCURACY",kDim,8.f,scale,opacity,true);
+                setWidgetCursor(pageX+20.f,cardY+390.f,scale);
+                ImGui::PushID("silent-aim-accuracy");
+                ImGui::SetNextItemWidth(196.f*scale);
+                const char* accuracyName=settings.accuracy==modules::AimAccuracy::Head?"Head":
+                    (settings.accuracy==modules::AimAccuracy::Loose?"Loose":"Center");
+                if (ui::BeginCombo("##accuracy",accuracyName)) {
+                    if (ImGui::Selectable("Center",settings.accuracy==modules::AimAccuracy::Center))
+                        settings.accuracy=modules::AimAccuracy::Center;
+                    if (ImGui::Selectable("Head",settings.accuracy==modules::AimAccuracy::Head))
+                        settings.accuracy=modules::AimAccuracy::Head;
+                    if (ImGui::Selectable("Loose",settings.accuracy==modules::AimAccuracy::Loose))
+                        settings.accuracy=modules::AimAccuracy::Loose;
+                    ui::EndCombo();
+                }
+                ImGui::PopID();
+                ImGui::PopID();
+                drawText(dl,origin,pageX+20.f,cardY+428.f,"The rotation eases onto the target from your own view, so a new lock sweeps in.",kDim,8.f,scale,opacity);
+                drawModuleKeybind(dl,origin,*entry,pageX+20.f,cardY+452.f,pageW-40.f,scale,opacity);
             } else if (expanded && std::string(entry->name)=="Anti-Bot") {
                 modules::AntiBotSettings& settings=modules::antiBotSettings();
                 ImGui::PushID("anti-bot-options");

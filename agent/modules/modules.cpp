@@ -62,6 +62,9 @@ AutoPressurePlateWebSettings g_autoPressurePlateWebSettings{};
 FastPlaceSettings g_fastPlaceSettings{};
 AutoJumpResetSettings g_autoJumpResetSettings{};
 AimAssistSettings g_aimAssistSettings{};
+bool g_silentAimModule = false;
+int g_silentAimModuleKey = 0;
+SilentAimSettings g_silentAimModuleSettings{};
 bool g_triggerbot = false;
 int g_triggerbotKey = 0;
 TriggerbotSettings g_triggerbotSettings{};
@@ -190,6 +193,7 @@ const std::vector<Entry> g_builtinEntries = {
     {"Sprint", "Experimental: keep sprinting without holding the sprint key", Category::Movement, &g_sprint, &g_sprintKey, false, Tag::Experimental},
     {"Auto Jump Reset", "Experimental: jump the moment another player damages you", Category::Combat, &g_autoJumpReset, &g_autoJumpResetKey, false, Tag::Experimental},
     {"AimAssist", "Experimental: smoothly rotate the real view onto players or entities", Category::Combat, &g_aimAssist, &g_aimAssistKey, false, Tag::Blatant},
+    {"Silent Aim", "Experimental: sweep the silent aim onto players or entities, camera untouched", Category::Combat, &g_silentAimModule, &g_silentAimModuleKey, false, Tag::Experimental},
     {"Anti-Bot", "Experimental: keep the entity modules off bots and NPCs", Category::Misc, &g_antiBot, &g_antiBotKey, false, Tag::Experimental},
     {"Nametags", "Experimental: info board above players (gear, held item, health, distance)", Category::Visual, &g_nametags, &g_nametagsKey, false, Tag::Experimental},
     {"StaticFov", "Experimental: field of view above the vanilla slider limit", Category::Visual, &g_staticFov, &g_staticFovKey, false, Tag::Experimental},
@@ -3606,6 +3610,171 @@ void silentPoseWatchdogWriteImpl() {
     e->DeleteLocalRef(player);
 }
 
+// ---- Silent Aim (Combat, experimental) ---------------------------------------------------------
+// A port of frost.rotation.mouse.SilentRotator. The Java class owns currentYaw/currentPitch and
+// walks them toward the target in update() through applyMouseDelta (a fixed 0.15 of the pending
+// delta), clamps the pitch to +-90 and reports completion inside one degree. Its relativeMode
+// exists because Frost turns the camera onto the server rotation; this client never turns the
+// camera, so the aim here is absolute. The 0.15 becomes the frame's alpha, which keeps the same
+// ease at any frame rate, and the sweep starts from the rotation the server already holds - so a
+// new target is acquired over several updates instead of snapping onto it.
+struct SilentRotator {
+    float currentYaw = 0.f;
+    float currentPitch = 0.f;
+    bool started = false;
+    bool complete = false;
+
+    static float clampPitch(float pitch) { return std::clamp(pitch, -90.f, 90.f); }
+
+    void reset(float yaw, float pitch) {
+        currentYaw = wrapDeg(yaw);
+        currentPitch = clampPitch(pitch);
+        started = true;
+        complete = false;
+    }
+
+    // Java update(): the yaw/pitch deltas, then the rotator's own step. `alpha` is that step's 0.15.
+    void update(float targetYaw, float targetPitch, float alpha) {
+        if (!started) { reset(targetYaw, targetPitch); return; }
+        applyMouseDelta(wrapDeg(targetYaw - currentYaw) * alpha,
+                        (targetPitch - currentPitch) * alpha);
+        complete = std::abs(wrapDeg(targetYaw - currentYaw)) < 1.f &&
+                   std::abs(targetPitch - currentPitch) < 1.f;
+    }
+
+    // Java applyMouseDelta().
+    void applyMouseDelta(float yawDelta, float pitchDelta) {
+        currentYaw = wrapDeg(currentYaw + yawDelta);
+        currentPitch = clampPitch(currentPitch + pitchDelta);
+    }
+
+    // Java getRenderedYaw()/getRenderedPitch().
+    float getRenderedYaw() const { return currentYaw; }
+    float getRenderedPitch() const { return clampPitch(currentPitch); }
+    bool isComplete() const { return complete; }
+};
+
+SilentRotator g_silentRotator;
+// The session this card started. AimAssist's Silent switch drives the same session, and only the
+// card that started it may end it.
+bool g_silentRotatorOwned = false;
+double g_silentRotatorSeenAt = -1.0;
+double g_silentRotatorLast = 0.0;
+
+void updateSilentAimModule() {
+    const bool ready = jni::ready() && mc::frame::valid() && mc::frame::resolved();
+    jobject playerObj = ready ? mc::Client::player() : nullptr;
+    jobject world = ready ? mc::Client::world() : nullptr;
+    // updateAimAssist runs first, so a session AimAssist's Silent switch is driving this frame
+    // already exists by the time this card sees it: it must not be stopped here, or the two cards
+    // would end each other's session every time both are on.
+    const bool assistDriving = g_aimAssist && g_aimAssistSettings.silent;
+    const auto forget = [&]() {
+        g_silentRotatorOwned = false;
+        g_silentRotator = SilentRotator{};
+        g_silentRotatorSeenAt = -1.0;
+    };
+    const auto release = [&]() {
+        if (g_silentRotatorOwned && !assistDriving) silentAimRelease(playerObj);
+        forget();
+    };
+    if (!g_silentAimModule) { release(); return; }
+    // AimAssist's own Silent switch drives the same session; one card at a time.
+    if (assistDriving) { forget(); return; }
+    const SilentAimSettings& st = g_silentAimModuleSettings;
+    const double now = ImGui::GetTime();
+    const bool blocked = !ready || !playerObj || !world || gui::inputFrozen() ||
+                         mc::Client::screenOpen() ||
+                         (st.onlyWhileAttacking && !gui::mouseDown(VK_LBUTTON)) ||
+                         (st.noGlide && mc::Player(playerObj).gliding());
+    if (blocked) {
+        // The same grace the silent AimAssist uses: one bad frame must not drop the aim.
+        if (g_silentRotatorOwned && g_silentRotatorSeenAt >= 0.0 &&
+            now - g_silentRotatorSeenAt <= kSilentTargetGrace) return;
+        release();
+        return;
+    }
+    JNIEnv* env = jni::env();
+    if (!env || !mc::sym().living) return;
+
+    mc::Player self(playerObj);
+    const Vec3 eye = self.eyePos();
+    const float curYaw = self.yaw(), curPitch = self.pitch();
+    const float lookYaw = curYaw * 0.017453292f, lookPitch = curPitch * 0.017453292f;
+    const Vec3 cameraLook(-std::sin(lookYaw) * std::cos(lookPitch), -std::sin(lookPitch),
+                          std::cos(lookYaw) * std::cos(lookPitch));
+    const float halfFov = std::clamp(st.fov, 5.f, 360.f) * 0.5f;
+
+    float bestAngle = 1e9f, wantYaw = 0.f, wantPitch = 0.f;
+    bool found = false;
+    for (int pass = 0; pass < 2 && !found; ++pass) {
+        if (pass == 1 && !g_silentAimActive) break;
+        Vec3 look = cameraLook;
+        if (pass == 1) {
+            // The aim the server already holds is the second reference: a camera turned away must
+            // not drop the target the rotator is sweeping onto.
+            const float sy = g_silentServerYaw * 0.017453292f, sp = g_silentServerPitch * 0.017453292f;
+            look = Vec3(-std::sin(sy) * std::cos(sp), -std::sin(sp), std::cos(sy) * std::cos(sp));
+        }
+        for (jobject entity : mc::collectEntities(world, 256)) {
+            if (!entity) continue;
+            const bool isLiving = env->IsInstanceOf(entity, mc::sym().living) == JNI_TRUE;
+            const bool isPlayer = isPlayerEntity(env, entity);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (isLiving && env->IsSameObject(entity, playerObj) != JNI_TRUE &&
+                ((isPlayer && st.allowPlayers) || (!isPlayer && st.allowEntities)) &&
+                !entityBlocked(entity, isPlayer)) {
+                mc::LivingEntity t(entity);
+                const mc::Entity::Bounds b = t.interpolatedBounds(1.f);
+                if (t.alive() && b.valid && distanceToHitbox(eye, t, 1.f) <= st.range) {
+                    const Vec3 aim = aimPointFor(st.accuracy, b, eye, look, now, t.eyePos());
+                    const Vec3 d = aim - eye;
+                    const float dist = d.len();
+                    if (dist > 0.01f) {
+                        const float angle = std::acos(std::clamp(d.dot(look) / dist, -1.f, 1.f)) * 57.29578f;
+                        if (angle <= halfFov && angle < bestAngle) {
+                            bestAngle = angle;
+                            found = true;
+                            const SilentAngles solved = silentAimAngles(eye, aim);
+                            wantYaw = solved.yaw;
+                            wantPitch = solved.pitch;
+                        }
+                    }
+                }
+            }
+            env->DeleteLocalRef(entity);
+        }
+    }
+    if (!found) {
+        if (g_silentRotatorOwned && g_silentRotatorSeenAt >= 0.0 &&
+            now - g_silentRotatorSeenAt <= kSilentTargetGrace) return;
+        release();
+        return;
+    }
+    g_silentRotatorSeenAt = now;
+    if (!g_silentRotator.started) {
+        // Begin where the server already is - the live aim, otherwise the camera - so the first
+        // lock is a sweep from the player's own view, never an instant snap.
+        g_silentRotator.reset(g_silentAimActive ? g_silentServerYaw : curYaw,
+                              g_silentAimActive ? g_silentServerPitch : curPitch);
+        g_silentRotatorLast = now;
+    }
+    const float dt = (float)std::clamp(now - g_silentRotatorLast, 0.001, 0.1);
+    g_silentRotatorLast = now;
+    const float alpha = st.smooth ? 1.f - std::exp(-std::clamp(st.speed, 1.f, 40.f) * dt) : 1.f;
+    g_silentRotator.update(wantYaw, st.vertical ? wantPitch : g_silentRotator.currentPitch, alpha);
+    const float aimYaw = g_silentRotator.getRenderedYaw();
+    const float aimPitch = st.vertical ? g_silentRotator.getRenderedPitch() : curPitch;
+    // The body follows the aim; the camera is never written. The movement-packet transform carries
+    // the rotation, and the game's own crosshair pick is computed from it.
+    g_silentPoseYaw = aimYaw;
+    const bool wasActive = g_silentAimActive;
+    silentAimSend(playerObj, aimYaw, aimPitch);
+    // Only a session this card started is ended by it; one a silent throw or another card owns is
+    // left to its owner.
+    if (!wasActive && g_silentAimActive) g_silentRotatorOwned = true;
+}
+
 void updateAimAssist() {
     const bool ready=jni::ready() && mc::frame::valid() && mc::frame::resolved();
     jobject playerObj=ready?mc::Client::player():nullptr;
@@ -6997,6 +7166,7 @@ AutoPressurePlateWebSettings& autoPressurePlateWebSettings() { return g_autoPres
 FastPlaceSettings& fastPlaceSettings() { return g_fastPlaceSettings; }
 AutoJumpResetSettings& autoJumpResetSettings() { return g_autoJumpResetSettings; }
 AimAssistSettings& aimAssistSettings() { return g_aimAssistSettings; }
+SilentAimSettings& silentAimModuleSettings() { return g_silentAimModuleSettings; }
 TriggerbotSettings& triggerbotSettings() { return g_triggerbotSettings; }
 AutoMaceSettings& autoMaceSettings() { return g_autoMaceSettings; }
 AntiBotSettings& antiBotSettings() { return g_antiBotSettings; }
@@ -7181,6 +7351,7 @@ void drawOverlay(float tickDelta) {
     processModuleKeybinds();
     java::tick(tickDelta);
     updateAimAssist();
+    updateSilentAimModule();
     updateTriggerbot();
     updateAutoMace();
     updateAutoJumpReset();
@@ -7425,6 +7596,14 @@ std::string serialize() {
         {"weaponOnly",g_aimAssistSettings.weaponOnly},
         {"silent",g_aimAssistSettings.silent},{"accuracy",(int)g_aimAssistSettings.accuracy},
         {"noGlide",g_aimAssistSettings.noGlide}};
+    j["silentAimModule"]={{"allowPlayers",g_silentAimModuleSettings.allowPlayers},
+        {"allowEntities",g_silentAimModuleSettings.allowEntities},
+        {"range",g_silentAimModuleSettings.range},{"fov",g_silentAimModuleSettings.fov},
+        {"speed",g_silentAimModuleSettings.speed},{"smooth",g_silentAimModuleSettings.smooth},
+        {"vertical",g_silentAimModuleSettings.vertical},
+        {"onlyWhileAttacking",g_silentAimModuleSettings.onlyWhileAttacking},
+        {"accuracy",(int)g_silentAimModuleSettings.accuracy},
+        {"noGlide",g_silentAimModuleSettings.noGlide}};
     j["antiBot"]={{"checkNames",g_antiBotSettings.checkNames},{"checkUuid",g_antiBotSettings.checkUuid},
         {"allowOfflineUuid",g_antiBotSettings.allowOfflineUuid},{"checkClones",g_antiBotSettings.checkClones}};
     j["nametags"]={{"showName",g_nametagsSettings.showName},{"showHealth",g_nametagsSettings.showHealth},
@@ -7652,6 +7831,18 @@ bool deserialize(const std::string& jsonText) {
         g_aimAssistSettings.accuracy=aa.value("accuracy",0)==1?AimAccuracy::Head:
             (aa.value("accuracy",0)==2?AimAccuracy::Loose:AimAccuracy::Center);
         g_aimAssistSettings.noGlide=aa.value("noGlide",false);
+        const auto sa=j.value("silentAimModule",nlohmann::json::object());
+        g_silentAimModuleSettings.allowPlayers=sa.value("allowPlayers",true);
+        g_silentAimModuleSettings.allowEntities=sa.value("allowEntities",true);
+        g_silentAimModuleSettings.range=std::clamp(sa.value("range",6.f),1.f,12.f);
+        g_silentAimModuleSettings.fov=std::clamp(sa.value("fov",180.f),10.f,360.f);
+        g_silentAimModuleSettings.speed=std::clamp(sa.value("speed",6.f),1.f,40.f);
+        g_silentAimModuleSettings.smooth=sa.value("smooth",true);
+        g_silentAimModuleSettings.vertical=sa.value("vertical",true);
+        g_silentAimModuleSettings.onlyWhileAttacking=sa.value("onlyWhileAttacking",false);
+        g_silentAimModuleSettings.accuracy=sa.value("accuracy",0)==1?AimAccuracy::Head:
+            (sa.value("accuracy",0)==2?AimAccuracy::Loose:AimAccuracy::Center);
+        g_silentAimModuleSettings.noGlide=sa.value("noGlide",false);
         const auto ab=j.value("antiBot",nlohmann::json::object());
         g_antiBotSettings.checkNames=ab.value("checkNames",true);
         g_antiBotSettings.checkUuid=ab.value("checkUuid",true);

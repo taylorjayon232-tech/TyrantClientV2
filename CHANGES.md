@@ -1,3 +1,18 @@
+# Combat - Silent Aim, a rotator ported from Frost
+
+- **Silent Aim** (Combat, experimental) is a card of its own beside AimAssist: a port of Frost's
+  `SilentRotator` (`frost.rotation.mouse`) that keeps its own current yaw/pitch and eases them onto
+  the solved target rotation, so a new target is acquired with a sweep instead of a silent snap.
+  Targets players and entities separately, with Range, FOV, Smoothing speed, Vertical aim, Accuracy,
+  Only While Holding Attack and No Glide of its own.
+- The sweep starts from the rotation the server already holds (the live aim, otherwise the camera),
+  and the frame's alpha replaces the Java rotator's fixed 0.15 step so the ease does not depend on
+  the frame rate. The rotation rides the same movement-packet transform as the rest of the silent
+  aim: the camera, body and model stay where the player put them, and the game's crosshair pick is
+  computed from the aim.
+- AimAssist's own **Silent AimAssist** switch keeps working; while it is on the Silent Aim card
+  stands down so only one card drives the session.
+
 # Passive - Silent Aim is computed inside the game's own crosshair pick
 
 - **The aim owns the pick now, instead of writing it after the frame.** The game builds its pick in

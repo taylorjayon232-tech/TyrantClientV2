@@ -242,6 +242,24 @@ struct AimAssistSettings {
     bool noGlide = false;          // do nothing while an elytra is gliding
 };
 
+// Combat (experimental): a Silent Aim card of its own, ported from Frost's SilentRotator
+// (frost.rotation.mouse). Unlike AimAssist's Silent switch this rotator keeps its own current
+// yaw/pitch and eases them onto the solved target over several updates, so a new target is a
+// sweep instead of a snap. The camera is never written: the rotation goes to the server and the
+// game's own crosshair pick reads it.
+struct SilentAimSettings {
+    bool allowPlayers = true;
+    bool allowEntities = true;
+    float range = 6.f;             // blocks (eye -> hitbox)
+    float fov = 180.f;             // degrees, total cone around the camera and the live aim
+    float speed = 6.f;             // smoothing speed (higher = snappier)
+    bool smooth = true;            // off = snap on acquisition, the raw rotator start
+    bool vertical = true;
+    bool onlyWhileAttacking = false;
+    AimAccuracy accuracy = AimAccuracy::Center;
+    bool noGlide = false;          // do nothing while an elytra is gliding
+};
+
 // ---- Round 5 (experimental) modules ---------------------------------------
 
 // Misc: stop the entity-targeting modules from acting on bots / NPCs. The verdict comes from the
@@ -593,6 +611,7 @@ AutoPressurePlateWebSettings& autoPressurePlateWebSettings();
 FastPlaceSettings& fastPlaceSettings();
 AutoJumpResetSettings& autoJumpResetSettings();
 AimAssistSettings& aimAssistSettings();
+SilentAimSettings& silentAimModuleSettings();
 TriggerbotSettings& triggerbotSettings();
 AutoMaceSettings& autoMaceSettings();
 AntiBotSettings& antiBotSettings();
