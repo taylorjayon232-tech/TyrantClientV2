@@ -2679,10 +2679,10 @@ void updateTriggerbot() {
 // Height - the mace's damage is a function of the fall - then takes the mace out of the hotbar and
 // clicks once at the configured Hit delay.
 //
-// Every click is the game's own Attack And Destroy key pressed through the vanilla binding, so
-// MinecraftClient runs its own attack: its crosshair pick, its hand swing and the click a CPS HUD
-// counts. Nothing here sends an attack at the entity, and nothing waits for the attack charge - the
-// delays on the card are the whole timing, so a hit lands when the card says it does.
+// Every click is a real left click posted to the game window, so the game handles it through its own
+// Attack And Destroy binding: its crosshair pick, its hand swing and the click a CPS HUD counts.
+// Nothing here sends an attack at the entity, and nothing waits for the attack charge - the delays on
+// the card are the whole timing, so a hit lands when the card says it does.
 //
 // StunSlam puts the hotbar axe in front of the same smash: a raised shield is hit with the axe,
 // then, after the configured Axe delay (the time the shield needs to come down), the mace goes in
