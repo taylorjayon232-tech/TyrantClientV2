@@ -3707,6 +3707,7 @@ void updateSilentAimModule() {
 
     float bestAngle = 1e9f, wantYaw = 0.f, wantPitch = 0.f;
     bool found = false;
+    jobject bestEntity = nullptr;   // the aim's target, for the game's own crosshair pick
     for (int pass = 0; pass < 2 && !found; ++pass) {
         if (pass == 1 && !g_silentAimActive) break;
         Vec3 look = cameraLook;
@@ -3735,6 +3736,8 @@ void updateSilentAimModule() {
                         if (angle <= halfFov && angle < bestAngle) {
                             bestAngle = angle;
                             found = true;
+                            if (bestEntity) env->DeleteLocalRef(bestEntity);
+                            bestEntity = env->NewLocalRef(entity);
                             const SilentAngles solved = silentAimAngles(eye, aim);
                             wantYaw = solved.yaw;
                             wantPitch = solved.pitch;
@@ -3770,6 +3773,10 @@ void updateSilentAimModule() {
     g_silentPoseYaw = aimYaw;
     const bool wasActive = g_silentAimActive;
     silentAimSend(playerObj, aimYaw, aimPitch);
+    // The game's own crosshair pick follows the aim: the block under the camera stops being outlined
+    // and the attack indicator shows the target, whether or not the pick-level transform installed.
+    mc::Client::setCrosshairTargetEntity(bestEntity);
+    if (bestEntity) env->DeleteLocalRef(bestEntity);
     // Only a session this card started is ended by it; one a silent throw or another card owns is
     // left to its owner.
     if (!wasActive && g_silentAimActive) g_silentRotatorOwned = true;
@@ -3978,11 +3985,14 @@ void updateAimAssist() {
         // the action is being validated against, and the next update after the handoff hands the
         // aim back through one ordinary movement packet.
         if (!acting) silentAimSend(playerObj, aimYaw, aimPitch);
-        // Pick-level aim (installed above) already makes the game's own pick the aim's pick in the
-        // frame it is computed, which is what the HUD and the outline read. Only the fallback, where
-        // that transform is unavailable, writes the field by hand - one frame late, but it is all
-        // that build has.
-        if (!pickAim) mc::Client::setCrosshairTargetEntity(bestTarget.get());
+        // The crosshair field is set whether or not the pick-level transform is installed: the HUD
+        // attack indicator and the block outline read that one field, and the transform's recompute
+        // can legitimately come back with the camera's block pick (the aim's target outside the
+        // game's own entity range, a ray that only grazes the hitbox). The write keeps the game's own
+        // pick when it already holds this entity, so the transform's exact hit vector is preserved
+        // when it did its job - and when it did not, this is what removes the outline of the block
+        // under the camera and lights the attack indicator on the aim instead.
+        mc::Client::setCrosshairTargetEntity(bestTarget.get());
 
         // The tick that carries the pinned aim is the gate for the hit, never the camera.
         // Entity.age changes once per game tick, and sendMovementPackets runs inside that tick with

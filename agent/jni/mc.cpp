@@ -892,6 +892,19 @@ bool Client::setCrosshairTargetEntity(jobject entity) {
         e->DeleteLocalRef(clientClass);
     }
     if (!crossField) return false;
+    // Keep the pick the game already made for this same entity: with the pick-level transform that
+    // is the aim's own hit vector, and rebuilding it here would replace it with the entity's feet.
+    // When the field does not hold this entity (the transform is unavailable, or its recompute came
+    // back with the camera's block pick) the write below is what puts the target there, so the HUD
+    // attack indicator draws and the block under the camera stops being outlined.
+    if (entity) {
+        LocalRef current(e->GetObjectField(g_client, crossField));
+        jni::clearException(e, "crosshairTarget (read for write)");
+        if (current && hit::typeOf(current.get()) == 2) {
+            LocalRef held(hit::entity(current.get()));
+            if (held && e->IsSameObject(held.get(), entity) == JNI_TRUE) return true;
+        }
+    }
     LocalRef built;
     if (entity) {
         jclass hitCls = jni::findClass(e, "net/minecraft/class_3966");   // EntityHitResult
@@ -911,6 +924,23 @@ bool Client::setCrosshairTargetEntity(jobject entity) {
     }
     e->SetObjectField(g_client, crossField, built ? built.get() : nullptr);
     jni::clearException(e, "crosshairTarget set");
+    // The HUD reads the target state from `targetedEntity`, which the game fills from the pick at the
+    // end of its render. Writing it here as well means the indicator is on the aim's target in the
+    // same frame the field is set, instead of one frame behind it.
+    static jfieldID targetField = nullptr;
+    static bool targetProbed = false;
+    if (!targetProbed) {
+        targetProbed = true;
+        jclass clientClass = e->GetObjectClass(g_client);
+        targetField = e->GetFieldID(clientClass, fld::kClient_targetedEntity,
+                                   "Lnet/minecraft/class_1297;");
+        jni::clearException(e, "targetedEntity (write)");
+        e->DeleteLocalRef(clientClass);
+    }
+    if (targetField) {
+        e->SetObjectField(g_client, targetField, entity);
+        jni::clearException(e, "targetedEntity set");
+    }
     return true;
 }
 

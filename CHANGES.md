@@ -12,6 +12,13 @@
   computed from the aim.
 - AimAssist's own **Silent AimAssist** switch keeps working; while it is on the Silent Aim card
   stands down so only one card drives the session.
+- The block outline and the HUD attack indicator read the game's `crosshairTarget`, so the aim
+  writes that field (and `targetedEntity`) every frame it holds a target, whether or not the
+  pick-level transform installed. When the field already holds that entity's own pick the write is
+  skipped, so the transform's exact hit vector survives when it did its job; when it does not (the
+  transform is unavailable, or its recompute came back with the camera's block pick) the write is
+  what removes the outline of the block under the camera and lights the indicator on the aim, with
+  the camera, body and model still where the player put them. The Combat card writes it too.
 
 # Passive - Silent Aim is computed inside the game's own crosshair pick
 
