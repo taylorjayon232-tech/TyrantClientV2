@@ -39,7 +39,8 @@ inline size_t instructionLength(const Bytes& b, size_t base, size_t pos, size_t 
 
 // Returns false without changing out if the class layout or expected call sites differ.
 inline bool transform(const Bytes& in, const char* targetMethod, const char* helperClass,
-                      bool packets, Bytes& out) {
+                      bool packets, Bytes& out, bool tryPick = false, bool* pickPatched = nullptr) {
+    if (pickPatched) *pickPatched = false;
     if (in.size()<10 || u4(in,0)!=0xcafebabe) return false;
     uint16_t count=u2(in,8); if (!count || count>65520) return false;
     std::vector<Cp> cp(count); size_t p=10;
@@ -75,45 +76,80 @@ inline bool transform(const Bytes& in, const char* targetMethod, const char* hel
     if(p+2>in.size()) return false; uint16_t fields=u2(in,p); p+=2;
     while(fields--) { if(p+8>in.size()) return false; uint16_t a=u2(in,p+6); p+=8; if(!skipAttributes(p,a)) return false; }
     if(p+2>in.size()) return false; uint16_t methods=u2(in,p); p+=2;
+    auto methodRef=[&](uint16_t i, std::string& nm, std::string& ds)->bool {
+        if (i>=count || cp[i].tag!=10 || cp[i].b>=count || cp[cp[i].b].tag!=12) return false;
+        nm=utf(cp[cp[i].b].a); ds=utf(cp[cp[i].b].b); return true;
+    };
     struct Patch { size_t pos; bool pitch; }; std::vector<Patch> patches;
+    // Every pick ClientPlayerEntity.getCrosshairTarget produces passes through one call of
+    // checkCrosshairTargetRange(HitResult, Vec3d, double). Replacing that call lets a helper return
+    // a pick computed from the silent rotation while the rest of the game class - and the camera -
+    // is untouched. The call is looked for in the public method and its private static overload.
+    std::vector<size_t> pickSites;
     bool found=false;
     while(methods--) {
         if(p+8>in.size()) return false;
-        bool match=utf(u2(in,p+2))==targetMethod && utf(u2(in,p+4))=="()V";
-        if(!packets) match=utf(u2(in,p+2))==targetMethod && utf(u2(in,p+4))=="(FLnet/minecraft/class_243;)V";
+        const std::string methodNameHere=utf(u2(in,p+2));
+        bool match=methodNameHere==targetMethod && utf(u2(in,p+4))=="()V";
+        if(!packets) match=methodNameHere==targetMethod && utf(u2(in,p+4))=="(FLnet/minecraft/class_243;)V";
+        const bool pickMethod=tryPick && (methodNameHere=="method_76762" || methodNameHere=="method_76763");
         uint16_t attrs=u2(in,p+6); p+=8;
         while(attrs--) {
             if(p+6>in.size()) return false; uint16_t name=u2(in,p); uint32_t length=u4(in,p+2); p+=6;
             if(length>in.size()-p) return false;
-            if(match && utf(name)=="Code") {
-                if(found || length<8) return false; found=true;
+            if(utf(name)=="Code" && length>=8) {
                 uint32_t size=u4(in,p+4); size_t base=p+8, end=base+size;
                 if(size>length-8 || end>in.size()) return false;
+                if(match) { if(found) return false; found=true; }
                 for(size_t pos=base;pos<end;) {
                     size_t step=instructionLength(in,base,pos,end); if(!step || step>end-pos) return false;
-                    if(in[pos]==0xb6 && step==3) {
+                    if(match && in[pos]==0xb6 && step==3) {
                         std::string name2=methodName(u2(in,pos+1));
                         if(name2=="method_36454" || (packets && name2=="method_36455")) patches.push_back({pos,name2=="method_36455"});
                     }
+                    if(pickMethod && in[pos]==0xb8 && step==3) {
+                        std::string nm,ds;
+                        if(methodRef(u2(in,pos+1),nm,ds) && nm=="method_76764" && ds=="(Lftk;Lftm;D)Lftk;")
+                            pickSites.push_back(pos);
+                    }
                     pos+=step;
                 }
-            }
+            } else if(match && utf(name)=="Code") return false;
             p+=length;
         }
     }
     if(!found || (!packets && patches.size()!=1) || (packets && patches.size()!=8)) return false;
+    const bool pickOk=tryPick && pickSites.size()==1;
     Bytes extra;
     // Constant pool: helper class, descriptor, two method names and two Methodrefs.
     putUtf(extra,helperClass); extra.push_back(7); put2(extra,count);
     putUtf(extra,"(Ljava/lang/Object;)F");
     putUtf(extra,packets ? "packetYaw" : "movementYaw");
-    putRef(extra,12,count+3,count+2); putRef(extra,10,count+1,count+4);
-    putUtf(extra,"packetPitch"); putRef(extra,12,count+6,count+2); putRef(extra,10,count+1,count+7);
+    putRef(extra,12,uint16_t(count+3),uint16_t(count+2)); putRef(extra,10,uint16_t(count+1),uint16_t(count+4));
+    putUtf(extra,"packetPitch"); putRef(extra,12,uint16_t(count+6),uint16_t(count+2));
+    putRef(extra,10,uint16_t(count+1),uint16_t(count+7));
+    if(pickOk) {
+        // Same descriptor as the call it replaces, so the arguments already on the stack stand.
+        putUtf(extra,"tyrant/internal/SilentPickHelper");
+        extra.push_back(7); put2(extra,uint16_t(count+9));
+        putUtf(extra,"pick");
+        putUtf(extra,"(Lftk;Lftm;D)Lftk;");
+        putRef(extra,12,uint16_t(count+11),uint16_t(count+12));
+        putRef(extra,10,uint16_t(count+10),uint16_t(count+13));
+    }
     Bytes result; result.reserve(in.size()+extra.size());
-    result.insert(result.end(),in.begin(),in.begin()+8); put2(result,uint16_t(count+9));
+    result.insert(result.end(),in.begin(),in.begin()+8); put2(result,uint16_t(count+(pickOk?15:9)));
     result.insert(result.end(),in.begin()+10,in.begin()+cpEnd); result.insert(result.end(),extra.begin(),extra.end());
     result.insert(result.end(),in.begin()+cpEnd,in.end());
-    for(const Patch& patch:patches) { size_t at=patch.pos+extra.size(); result[at]=0xb8; uint16_t ref=uint16_t(count+(patch.pitch?8:5)); result[at+1]=uint8_t(ref>>8); result[at+2]=uint8_t(ref); }
+    for(const Patch& patch:patches) {
+        size_t at=patch.pos+extra.size(); result[at]=0xb8;
+        uint16_t ref=uint16_t(count+(patch.pitch?8:5)); result[at+1]=uint8_t(ref>>8); result[at+2]=uint8_t(ref);
+    }
+    if(pickOk) {
+        size_t at=pickSites[0]+extra.size(); result[at]=0xb8; uint16_t ref=uint16_t(count+14);
+        result[at+1]=uint8_t(ref>>8); result[at+2]=uint8_t(ref);
+    }
+    if(pickPatched) *pickPatched=pickOk;
     out=std::move(result); return true;
 }
 } // namespace tyr::jni::silent_transform

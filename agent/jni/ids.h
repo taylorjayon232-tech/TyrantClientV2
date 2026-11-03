@@ -85,6 +85,7 @@ constexpr auto kClient_mouse       = "field_1729";  // Mouse mouse
 constexpr auto kClient_gameRenderer= "field_1773";  // GameRenderer gameRenderer
 constexpr auto kClient_tickCounter = "field_52750"; // RenderTickCounter.Dynamic
 constexpr auto kClient_crosshair   = "field_1765";  // HitResult crosshairTarget (game's own raycast)
+constexpr auto kClient_targetedEntity = "field_1692"; // Entity targetedEntity (HUD attack indicator)
 constexpr auto kClient_currentScreen = "field_1755"; // Screen currently open, null while in-world
 constexpr auto kClient_attackCooldown = "field_1771"; // int attackCooldown (vanilla "miss time")
 

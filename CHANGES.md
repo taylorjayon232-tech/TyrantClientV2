@@ -1,3 +1,21 @@
+# Passive - Silent Aim is computed inside the game's own crosshair pick
+
+- **The aim owns the pick now, instead of writing it after the frame.** The game builds its pick in
+  `ClientPlayerEntity.getCrosshairTarget`, and that one value drives the HUD attack indicator, the
+  block outline, and vanilla's own `doAttack` / `doItemUse`. Silent Aim rewrites that computation
+  (the single `checkCrosshairTargetRange` call it passes through) so the pick is raycast from the
+  silent rotation: the indicator draws on the aim's target, the block the camera looks at is no
+  longer outlined, and a click is answered by the game itself against the aim - in the same frame,
+  with the camera, body and model untouched. The end-of-frame `crosshairTarget` write stays only as
+  the fallback for a build where the transform cannot install.
+- **`targetedEntity` moves with the pick.** It is set from the aim's pick inside the same call, so the
+  HUD's "target acquired" state can never be one frame behind or left over from the camera's pick.
+- **Block actions stand down while the aim holds a target.** With the pick on the target there is no
+  block under the crosshair, so breaking and placing do not start; the camera handoff is used only by
+  the field-write fallback.
+- **One attack, not two.** When the pick-level aim is installed the module no longer sends its own
+  delayed `attackEntity`: vanilla's click already hits the aim's target, so that swing is skipped.
+
 # Passive - AutoMace rebuilt around the real Attack click, in milliseconds
 
 ## Passive - StunSlam retries the stun, No Glide, Triggerbot waits for the charge

@@ -3627,11 +3627,20 @@ void updateAimAssist() {
     // attack; the input hook reads this flag (one frame later) to decide what a press starts.
     g_cameraOnBlock = false;
     g_cameraOnEntity = false;
+    // With pick-level targeting the game's own crosshair is computed from the aim, so the field no
+    // longer says where the camera looks. The camera's pick is kept for the two questions that are
+    // still about the view: is this press a block action, and is vanilla already on an entity.
+    const bool pickAim = jni::silentAimPickActive();
     if (ready && playerObj) {
-        mc::LocalRef hit(mc::Client::crosshair());
-        const int hitType = hit ? mc::hit::typeOf(hit.get()) : 0;
+        jobject cameraPick = pickAim ? jni::silentAimCameraPick() : nullptr;
+        mc::LocalRef cameraOwned(cameraPick ? nullptr : mc::Client::crosshair());
+        if (!cameraPick) cameraPick = cameraOwned.get();
+        const int hitType = cameraPick ? mc::hit::typeOf(cameraPick) : 0;
         g_cameraOnBlock = hitType == 1;
         g_cameraOnEntity = hitType == 2;
+        if (cameraPick && !cameraOwned) {
+            if (JNIEnv* pe = jni::env()) pe->DeleteLocalRef(cameraPick);
+        }
     }
     if (!g_aimAssist) { silentAimRelease(playerObj); return; }   // module off: end immediately
     const AimAssistSettings& st=g_aimAssistSettings;
@@ -3748,11 +3757,14 @@ void updateAimAssist() {
         // these calls renew it while the button is held and are the fallback when that hook is not
         // available. A left click anywhere but a block is a combat click: it ends the handoff at
         // once, so the aim is back on the server for the swing this press arms.
-        const bool leftHeld = gui::mouseDown(VK_LBUTTON);
+        // Pick-level aim: the game resolves every click against the aim itself, which is the whole
+        // point - a block action is not started while the crosshair is on the target. The camera
+        // handoff exists for the field-write fallback, so it is not used here.
+        const bool leftHeld = !pickAim && gui::mouseDown(VK_LBUTTON);
         if (leftHeld) {
             if (g_cameraOnBlock) silentAimActionHold(true, kActionLease);
             else g_actionHoldUntil = -1.0;
-        } else if (gui::mouseDown(VK_RBUTTON)) {
+        } else if (!pickAim && gui::mouseDown(VK_RBUTTON)) {
             silentAimActionHold(false, kActionLease);
         }
         const bool acting = actionHolding();
@@ -3760,7 +3772,8 @@ void updateAimAssist() {
             // The camera already on an entity means the game's own attack handles this click: it
             // hits that entity in this same tick (or did, just before the frame), so adding the
             // silent swing would send two attacks for one press.
-            if (chargeAtClick && bestTarget && !g_attackSentThisFrame && !acting && !g_cameraOnEntity) {
+            if (chargeAtClick && bestTarget && !g_attackSentThisFrame && !acting &&
+                !g_cameraOnEntity && !pickAim) {
                 // One press, one hit. The exact solved angle is pinned, the game's own movement
                 // packet carries it on the next tick, and the hit goes out after that packet. No
                 // look packet is sent for the hit, so a duplicate rotation can never be the price
@@ -3796,12 +3809,11 @@ void updateAimAssist() {
         // the action is being validated against, and the next update after the handoff hands the
         // aim back through one ordinary movement packet.
         if (!acting) silentAimSend(playerObj, aimYaw, aimPitch);
-        // The game's crosshair pick is what the HUD's attack indicator and the block outline read.
-        // While the aim holds a target the pick is set to that entity, exactly as it would be if the
-        // camera had turned: the indicator draws and the block behind the camera stops being
-        // outlined, while the view itself never moves. The game recomputes the pick every frame, so
-        // this is renewed per frame and needs no teardown.
-        mc::Client::setCrosshairTargetEntity(bestTarget.get());
+        // Pick-level aim (installed above) already makes the game's own pick the aim's pick in the
+        // frame it is computed, which is what the HUD and the outline read. Only the fallback, where
+        // that transform is unavailable, writes the field by hand - one frame late, but it is all
+        // that build has.
+        if (!pickAim) mc::Client::setCrosshairTargetEntity(bestTarget.get());
 
         // The tick that carries the pinned aim is the gate for the hit, never the camera.
         // Entity.age changes once per game tick, and sendMovementPackets runs inside that tick with
@@ -3809,7 +3821,7 @@ void updateAimAssist() {
         // server already had it). Once the age has changed, the server is holding the aim this hit
         // is validated against. The fallback (no transform) instead waits until its own look packet
         // with the pinned angle has actually gone out.
-        if (g_silentAttackWaiting && bestTarget && !g_attackSentThisFrame && !acting) {
+        if (g_silentAttackWaiting && bestTarget && !g_attackSentThisFrame && !acting && !pickAim) {
             const int age = self.age();
             const bool carried = g_silentUsingPackets
                 ? (age >= 0 ? age != g_silentAttackAge
@@ -6952,6 +6964,9 @@ void silentPoseWatchdogWrite() { silentPoseWatchdogWriteImpl(); }
 bool onInputMessage(void* hwnd, uint32_t msg, uint64_t wParam, int64_t lParam) {
     (void)hwnd; (void)wParam; (void)lParam;
     if (!g_silentAimActive || gui::inputFrozen() || !jni::ready() || !mc::frame::resolved()) return false;
+    // Pick-level aim: the game itself answers the click against the aim, so there is nothing to hand
+    // over - and a world action must not be started while the crosshair is on the target.
+    if (jni::silentAimPickActive()) return false;
     if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK) {
         silentAimActionHold(false, kActionLease);   // place / eat / shield / use item
     } else if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK) {
