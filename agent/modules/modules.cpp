@@ -2903,7 +2903,7 @@ void updateAutoMace() {
             if (now < g_maceStageAt) return;
             const int plate = maceFindHotbarChestplate(list.get());
             if (plate >= 0 && maceHoldingSlotItem(list.get(), playerObj, plate)) {
-                const std::string id = maceItemId(list, plate);
+                const std::string id = maceItemId(list.get(), plate);
                 if (!id.empty() && maceEquipHeld(playerObj, id.c_str())) g_maceChestSwapped = true;
             }
             const int mace = maceFindHotbar(list.get(), "mace");
