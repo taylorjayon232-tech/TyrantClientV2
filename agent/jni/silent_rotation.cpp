@@ -35,11 +35,13 @@ bool g_installFailed=false;
 // target, and the retransform swaps the class's own checkCrosshairTargetRange call for it.
 jclass g_pickClass=nullptr;
 jmethodID g_getCrosshair=nullptr;
+jmethodID g_pickFull=nullptr;          // method_76763(Entity, double, double, float) -> HitResult
 jfieldID g_renderYaw=nullptr, g_renderPitch=nullptr, g_lastRenderYaw=nullptr, g_lastRenderPitch=nullptr;
 jfieldID g_targetedEntity=nullptr;
 jobject g_cameraPick=nullptr;      // global ref: the game's own pick for this frame
 std::atomic<bool> g_pickReady{false};
 std::atomic<bool> g_pickMask{false};     // the transform swapped the pick call
+std::atomic<int>  g_pickKind{0};         // 1 = full pick, 2 = range-check fallback
 std::atomic<bool> g_pickPatched{false};  // ...and it is installed in the live game classes
 // Set while the helper calls the game's own pick again; the nested call must keep its result.
 thread_local bool g_inPick=false;
@@ -49,28 +51,32 @@ thread_local bool g_inPick=false;
 // The embedded bytes are generated from SilentRotationHelper.java with JDK 21.
 #include "silent_rotation_helper.inc"
 
-// The pick helper is built at runtime: one public static native method whose descriptor is exactly
-// the one of ClientPlayerEntity.checkCrosshairTargetRange(HitResult, Vec3d, double), so the
-// retransformed game class can call it with the arguments it already has on the stack. Nothing is
-// compiled ahead of time, so it needs no JDK on the build machine.
+// The pick helper is built at runtime: two public static native methods whose descriptors are exactly
+// the ones of the game calls they replace, so the retransformed class can call them with the arguments
+// it already has on the stack. `pickFull` takes the receiver (the player) first, which is the shape of
+// the method_76763 call inside the pick method; `pick` matches the older checkCrosshairTargetRange
+// patch and stays as the fallback. Nothing is compiled ahead of time, so it needs no JDK on the build
+// machine.
 silent_transform::Bytes pickHelperClass() {
     using namespace silent_transform;
     Bytes b;
     b.push_back(0xCA); b.push_back(0xFE); b.push_back(0xBA); b.push_back(0xBE);
     put2(b, 0); put2(b, 61);                        // minor, major (Java 17; the game runs 21)
-    put2(b, 7);                                      // constant pool count
+    put2(b, 9);                                      // constant pool count
     putUtf(b, "tyrant/internal/SilentPickHelper");   // 1
     b.push_back(7); put2(b, 1);                      // 2 Class #1
     putUtf(b, "java/lang/Object");                   // 3
     b.push_back(7); put2(b, 3);                      // 4 Class #3
     putUtf(b, "pick");                               // 5
     putUtf(b, "(Lnet/minecraft/class_239;Lnet/minecraft/class_243;D)Lnet/minecraft/class_239;"); // 6
+    putUtf(b, "pickFull");                           // 7
+    putUtf(b, "(Lnet/minecraft/class_746;Lnet/minecraft/class_1297;DDF)Lnet/minecraft/class_239;"); // 8
     put2(b, 0x0031);                                 // public final super
     put2(b, 2); put2(b, 4);                          // this, super
     put2(b, 0); put2(b, 0);                          // interfaces, fields
-    put2(b, 1);                                      // methods
-    put2(b, 0x0109);                                 // public static native
-    put2(b, 5); put2(b, 6); put2(b, 0);              // name, descriptor, attributes
+    put2(b, 2);                                      // methods
+    put2(b, 0x0109); put2(b, 5); put2(b, 6); put2(b, 0);   // public static native pick
+    put2(b, 0x0109); put2(b, 7); put2(b, 8); put2(b, 0);   // public static native pickFull
     put2(b, 0);                                      // class attributes
     return b;
 }
@@ -132,6 +138,77 @@ jobject JNICALL pickCrosshairNative(JNIEnv* e, jclass, jobject hit, jobject came
     return aim;
 }
 
+// The full pick. ClientPlayerEntity.method_76762 always calls method_76763(Entity, double, double,
+// float) to compute the crosshair target, so the transform swaps that call for this one. It receives
+// everything the game already resolved - the player, the camera entity and the two interaction ranges
+// - which means the hook runs on every frame and every view, not only when the camera's own ray
+// already found an entity. That was the hole: aiming at a player while looking at a wall never reached
+// the old range-check hook, so the game kept the wall's block pick and its outline stayed on.
+//
+// The camera's pick is computed first and kept for the block-action decision. The same computation is
+// then repeated with renderYaw/renderPitch set to the silent rotation; the game stores that result as
+// its own crosshairTarget, so the HUD attack indicator, the block outline, doAttack and doItemUse all
+// read the aim in the same frame. The four fields are restored before returning, so the camera never
+// moves.
+jobject JNICALL pickFullNative(JNIEnv* e, jclass, jobject player, jobject camera,
+                               jdouble blockRange, jdouble entityRange, jfloat tickProgress) {
+    if (!e || !player || !g_pickFull) return nullptr;
+    jvalue args[4];
+    args[0].l = camera;
+    args[1].d = blockRange;
+    args[2].d = entityRange;
+    args[3].f = tickProgress;
+    if (g_inPick) {   // reentered from the recomputation: keep it plain, with no second swap
+        jobject plain = e->CallObjectMethodA(player, g_pickFull, args);
+        if (e->ExceptionCheck()) { jni::clearException(e, "pick reentrant"); return nullptr; }
+        return plain;
+    }
+    jobject cameraPick = e->CallObjectMethodA(player, g_pickFull, args);
+    if (e->ExceptionCheck()) { jni::clearException(e, "pick camera"); return nullptr; }
+    if (cameraPick) {
+        if (g_cameraPick) e->DeleteGlobalRef(g_cameraPick);
+        g_cameraPick = e->NewGlobalRef(cameraPick);
+        if (e->ExceptionCheck()) jni::clearException(e, "camera pick cache");
+    }
+    if (!g_helper || e->GetStaticBooleanField(g_helper, g_active) != JNI_TRUE ||
+        !g_renderYaw || !g_renderPitch || !g_lastRenderYaw || !g_lastRenderPitch) return cameraPick;
+    const float yaw = e->GetStaticFloatField(g_helper, g_yaw);
+    const float pitch = e->GetStaticFloatField(g_helper, g_pitch);
+    const float was[4] = {
+        e->GetFloatField(player, g_renderYaw), e->GetFloatField(player, g_renderPitch),
+        e->GetFloatField(player, g_lastRenderYaw), e->GetFloatField(player, g_lastRenderPitch)};
+    e->SetFloatField(player, g_renderYaw, yaw);
+    e->SetFloatField(player, g_renderPitch, pitch);
+    e->SetFloatField(player, g_lastRenderYaw, yaw);
+    e->SetFloatField(player, g_lastRenderPitch, pitch);
+    g_inPick = true;
+    jobject aim = e->CallObjectMethodA(player, g_pickFull, args);
+    g_inPick = false;
+    const bool failed = e->ExceptionCheck() != JNI_FALSE;
+    if (failed) jni::clearException(e, "pick aim");
+    e->SetFloatField(player, g_renderYaw, was[0]);
+    e->SetFloatField(player, g_renderPitch, was[1]);
+    e->SetFloatField(player, g_lastRenderYaw, was[2]);
+    e->SetFloatField(player, g_lastRenderPitch, was[3]);
+    if (e->ExceptionCheck()) jni::clearException(e, "pick restore");
+    if (failed || !aim) return cameraPick;
+    // The HUD's target state comes from this field, so it is written in the same call that produced
+    // the pick: it can never be a frame behind, and it is cleared when the aim's pick is not an entity.
+    if (mc::sym().minecraft && mc::sym().mc_getInstance && g_targetedEntity) {
+        mc::LocalRef client(e->CallStaticObjectMethod(mc::sym().minecraft, mc::sym().mc_getInstance));
+        if (e->ExceptionCheck()) jni::clearException(e, "pick client");
+        else if (client) {
+            jobject target = nullptr;
+            if (mc::hit::typeOf(aim) == 2) target = mc::hit::entity(aim);
+            e->SetObjectField(client.get(), g_targetedEntity, target);
+            if (e->ExceptionCheck()) jni::clearException(e, "pick target entity");
+            if (target) e->DeleteLocalRef(target);
+        }
+    }
+    if (cameraPick) e->DeleteLocalRef(cameraPick);
+    return aim;
+}
+
 void JNICALL onClass(Ti* ti, JNIEnv* e, jclass klass, jobject, const char*, jobject,
                      jint size, const unsigned char* data, jint* newSize, unsigned char** newData) {
     if (!g_transformEnabled.load(std::memory_order_acquire) || !klass || size<=0 || !data) return;
@@ -140,13 +217,15 @@ void JNICALL onClass(Ti* ti, JNIEnv* e, jclass klass, jobject, const char*, jobj
     if (!entity && !player) return;
     try {
         silent_transform::Bytes in(data,data+size), out;
-        bool pick=false;
+        bool pick=false; int pickKind=0;
         if (!silent_transform::transform(in,entity?"method_5724":"method_3136",
                                          "tyrant/internal/SilentRotationHelper",player,out,
-                                         player && g_pickReady.load(std::memory_order_acquire), &pick)) {
+                                         player && g_pickReady.load(std::memory_order_acquire), &pick,
+                                         &pickKind)) {
             g_transformMask.fetch_or(entity?4:8,std::memory_order_relaxed); return;
         }
-        if (pick) g_pickMask.store(true,std::memory_order_relaxed);
+        if (pick) { g_pickMask.store(true,std::memory_order_relaxed);
+                    g_pickKind.store(pickKind,std::memory_order_relaxed); }
         using Allocate=Error (JNICALL*)(Ti*,jlong,unsigned char**);
         unsigned char* bytes=nullptr;
         if(tiFn<Allocate>(ti,46)(ti,jlong(out.size()),&bytes)!=0 || !bytes) return;
@@ -195,24 +274,29 @@ bool install(JNIEnv* e) {
             if(e->ExceptionCheck()) { clearException(e,"silent pick class"); pickCls=nullptr; }
         }
         if (pickCls) {
-            JNINativeMethod methods[1]={
+            JNINativeMethod methods[2]={
                 {const_cast<char*>("pick"),
                  const_cast<char*>("(Lnet/minecraft/class_239;Lnet/minecraft/class_243;D)Lnet/minecraft/class_239;"),
-                 reinterpret_cast<void*>(&pickCrosshairNative)}};
-            if(e->RegisterNatives(pickCls,methods,1)==0) g_pickClass=jclass(e->NewGlobalRef(pickCls));
+                 reinterpret_cast<void*>(&pickCrosshairNative)},
+                {const_cast<char*>("pickFull"),
+                 const_cast<char*>("(Lnet/minecraft/class_746;Lnet/minecraft/class_1297;DDF)Lnet/minecraft/class_239;"),
+                 reinterpret_cast<void*>(&pickFullNative)}};
+            if(e->RegisterNatives(pickCls,methods,2)==0) g_pickClass=jclass(e->NewGlobalRef(pickCls));
             else clearException(e,"silent pick native");
             e->DeleteLocalRef(pickCls);
         }
         if (g_pickClass) {
             g_getCrosshair=e->GetMethodID(mc::sym().clientPlayer,"method_76762",
                 "(FLnet/minecraft/class_1297;)Lnet/minecraft/class_239;");
+            g_pickFull=e->GetMethodID(mc::sym().clientPlayer,"method_76763",
+                "(Lnet/minecraft/class_1297;DDF)Lnet/minecraft/class_239;");
             g_renderYaw=e->GetFieldID(mc::sym().clientPlayer,"field_3932","F");
             g_renderPitch=e->GetFieldID(mc::sym().clientPlayer,"field_3916","F");
             g_lastRenderYaw=e->GetFieldID(mc::sym().clientPlayer,"field_3931","F");
             g_lastRenderPitch=e->GetFieldID(mc::sym().clientPlayer,"field_3914","F");
             g_targetedEntity=e->GetFieldID(mc::sym().minecraft,fld::kClient_targetedEntity,
                                            "Lnet/minecraft/class_1297;");
-            if(e->ExceptionCheck() || !g_getCrosshair || !g_renderYaw || !g_renderPitch ||
+            if(e->ExceptionCheck() || !g_getCrosshair || !g_pickFull || !g_renderYaw || !g_renderPitch ||
                !g_lastRenderYaw || !g_lastRenderPitch) {
                 clearException(e,"silent pick members");
                 e->DeleteGlobalRef(g_pickClass); g_pickClass=nullptr;
@@ -235,7 +319,7 @@ bool install(JNIEnv* e) {
         tiFn<Error (JNICALL*)(Ti*)>(ti,127)(ti); e->DeleteGlobalRef(g_helper); g_helper=nullptr; return false;
     }
     jclass classes[]{mc::sym().entity,mc::sym().clientPlayer};
-    g_transformMask.store(0); g_pickMask.store(false); g_transformEnabled.store(true,std::memory_order_release);
+    g_transformMask.store(0); g_pickMask.store(false); g_pickKind.store(0); g_transformEnabled.store(true,std::memory_order_release);
     Error err=tiFn<Retransform>(ti,152)(ti,2,classes);
     g_transformEnabled.store(false,std::memory_order_release);
     if(err!=0 || g_transformMask.load()!=3) {
@@ -243,7 +327,7 @@ bool install(JNIEnv* e) {
         if(err==0) tiFn<Retransform>(ti,152)(ti,2,classes);
         tiFn<SetEvent>(ti,2)(ti,0,54,nullptr);
         tiFn<Error (JNICALL*)(Ti*)>(ti,127)(ti);
-        g_pickPatched.store(false); g_pickReady.store(false); g_pickMask.store(false);
+        g_pickPatched.store(false); g_pickReady.store(false); g_pickMask.store(false); g_pickKind.store(0);
         e->DeleteGlobalRef(g_helper); g_helper=nullptr; return false;
     }
     g_pickPatched.store(g_pickReady.load() && g_pickMask.load(),std::memory_order_relaxed);
@@ -292,7 +376,7 @@ void silentRotationShutdown() {
     if(err!=0) trace::log("silent aim: restoring game classes failed (%d); inactive Java helper remains",int(err));
     tiFn<SetEvent>(g_ti,2)(g_ti,0,54,nullptr);
     tiFn<Error (JNICALL*)(Ti*)>(g_ti,127)(g_ti);
-    g_pickPatched.store(false); g_pickReady.store(false); g_pickMask.store(false); g_inPick=false;
+    g_pickPatched.store(false); g_pickReady.store(false); g_pickMask.store(false); g_pickKind.store(0); g_inPick=false;
     if(JNIEnv* e=env()) {
         e->DeleteGlobalRef(g_helper);
         if(g_cameraPick) { e->DeleteGlobalRef(g_cameraPick); g_cameraPick=nullptr; }
@@ -302,6 +386,13 @@ void silentRotationShutdown() {
 }
 
 bool silentAimPickActive() { return g_pickPatched.load(std::memory_order_acquire); }
+
+// Which pick path the transform installed: 1 = the pick method's own raycast call, 2 = the old
+// range-check fallback, 0 = neither (the crosshair field write is then all the build has).
+int silentAimPickMode() {
+    if (!g_pickPatched.load(std::memory_order_acquire)) return 0;
+    return g_pickKind.load(std::memory_order_relaxed);
+}
 
 jobject silentAimCameraPick() {
     JNIEnv* e=env();

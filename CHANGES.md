@@ -1,3 +1,22 @@
+# Combat - StunSlam's axe beat, and the pick the game actually uses
+
+- **StunSlam waits 25 ms between the axe going into the hand and the click.** The slot is synced at
+  once, but the server resolves an attack against the item it holds when the packet lands there, so a
+  click in the same breath as the swap was still read as the mace and the shield never came down.
+  Every axe selection now starts that beat (a retry included), and the swing waits it out before it
+  presses.
+- **The silent aim's pick hook replaces the full pick instead of the range check.** The old patch
+  swapped `checkCrosshairTargetRange`, which the game only calls once the camera's own ray has already
+  found an entity - so aiming at a player while looking at a wall never reached it, the game kept the
+  wall's block pick and its outline stayed on. The patch now replaces the pick method's call to the
+  block + entity raycast itself, so it runs on every frame and every view, and it matches the class
+  file with the runtime's own names. The camera's pick is computed first and kept for the block-action
+  decision; the aim's pick is what the game stores, so the block outline is gone and the attack
+  indicator shows the target while the camera stays exactly where the player put it.
+- **Debug Mode shows which pick path is live**: `pick aim (full)` when the pick method's own raycast
+  call is replaced, `aim (range)` for the fallback, `camera` when neither installed - next to what the
+  free camera is looking at, so the state can be confirmed without the log.
+
 # Combat - Silent Aim, a rotator ported from Frost
 
 - **Silent Aim** (Combat, experimental) is a card of its own beside AimAssist: a port of Frost's

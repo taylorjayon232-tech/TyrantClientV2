@@ -39,8 +39,10 @@ inline size_t instructionLength(const Bytes& b, size_t base, size_t pos, size_t 
 
 // Returns false without changing out if the class layout or expected call sites differ.
 inline bool transform(const Bytes& in, const char* targetMethod, const char* helperClass,
-                      bool packets, Bytes& out, bool tryPick = false, bool* pickPatched = nullptr) {
+                      bool packets, Bytes& out, bool tryPick = false, bool* pickPatched = nullptr,
+                      int* pickKind = nullptr) {
     if (pickPatched) *pickPatched = false;
+    if (pickKind) *pickKind = 0;
     if (in.size()<10 || u4(in,0)!=0xcafebabe) return false;
     uint16_t count=u2(in,8); if (!count || count>65520) return false;
     std::vector<Cp> cp(count); size_t p=10;
@@ -81,18 +83,24 @@ inline bool transform(const Bytes& in, const char* targetMethod, const char* hel
         nm=utf(cp[cp[i].b].a); ds=utf(cp[cp[i].b].b); return true;
     };
     struct Patch { size_t pos; bool pitch; }; std::vector<Patch> patches;
-    // Every pick ClientPlayerEntity.getCrosshairTarget produces passes through one call of
-    // checkCrosshairTargetRange(HitResult, Vec3d, double). Replacing that call lets a helper return
-    // a pick computed from the silent rotation while the rest of the game class - and the camera -
-    // is untouched. The call is looked for in the public method and its private static overload.
-    std::vector<size_t> pickSites;
+    // Two ways into the crosshair pick, in order of preference:
+    //  - method_76762 (getCrosshairTarget) always calls method_76763(Entity, double, double, float),
+    //    the full block + entity raycast. Replacing THAT call runs on every frame and every view,
+    //    which is what lets the aim own the pick while the camera looks at a wall.
+    //  - checkCrosshairTargetRange(method_76764) only runs when the camera's own ray already found an
+    //    entity, so it is kept as the fallback for a class whose pick method the scan cannot read.
+    // Descriptors are the ones the runtime class file carries: Fabric's intermediary names
+    // (net/minecraft/class_*), the same style the movement method below is matched with.
+    std::vector<size_t> rangeSites;
+    std::vector<size_t> fullSites;
     bool found=false;
     while(methods--) {
         if(p+8>in.size()) return false;
         const std::string methodNameHere=utf(u2(in,p+2));
         bool match=methodNameHere==targetMethod && utf(u2(in,p+4))=="()V";
         if(!packets) match=methodNameHere==targetMethod && utf(u2(in,p+4))=="(FLnet/minecraft/class_243;)V";
-        const bool pickMethod=tryPick && (methodNameHere=="method_76762" || methodNameHere=="method_76763");
+        const bool pickFullMethod=tryPick && methodNameHere=="method_76762";
+        const bool pickRangeMethod=tryPick && methodNameHere=="method_76763";
         uint16_t attrs=u2(in,p+6); p+=8;
         while(attrs--) {
             if(p+6>in.size()) return false; uint16_t name=u2(in,p); uint32_t length=u4(in,p+2); p+=6;
@@ -107,10 +115,17 @@ inline bool transform(const Bytes& in, const char* targetMethod, const char* hel
                         std::string name2=methodName(u2(in,pos+1));
                         if(name2=="method_36454" || (packets && name2=="method_36455")) patches.push_back({pos,name2=="method_36455"});
                     }
-                    if(pickMethod && in[pos]==0xb8 && step==3) {
+                    if(pickFullMethod && (in[pos]==0xb6 || in[pos]==0xb7) && step==3) {
                         std::string nm,ds;
-                        if(methodRef(u2(in,pos+1),nm,ds) && nm=="method_76764" && ds=="(Lftk;Lftm;D)Lftk;")
-                            pickSites.push_back(pos);
+                        if(methodRef(u2(in,pos+1),nm,ds) && nm=="method_76763" &&
+                           ds=="(Lnet/minecraft/class_1297;DDF)Lnet/minecraft/class_239;")
+                            fullSites.push_back(pos);
+                    }
+                    if(pickRangeMethod && in[pos]==0xb8 && step==3) {
+                        std::string nm,ds;
+                        if(methodRef(u2(in,pos+1),nm,ds) && nm=="method_76764" &&
+                           ds=="(Lnet/minecraft/class_239;Lnet/minecraft/class_243;D)Lnet/minecraft/class_239;")
+                            rangeSites.push_back(pos);
                     }
                     pos+=step;
                 }
@@ -119,7 +134,11 @@ inline bool transform(const Bytes& in, const char* targetMethod, const char* hel
         }
     }
     if(!found || (!packets && patches.size()!=1) || (packets && patches.size()!=8)) return false;
-    const bool pickOk=tryPick && pickSites.size()==1;
+    // Every method_76763 call inside the pick method is replaced, so a class that computes the pick
+    // in more than one branch is still covered; the range fallback needs its one call site.
+    const bool fullOk=tryPick && !fullSites.empty();
+    const bool rangeOk=tryPick && !fullOk && rangeSites.size()==1;
+    const bool pickOk=fullOk || rangeOk;
     Bytes extra;
     // Constant pool: helper class, descriptor, two method names and two Methodrefs.
     putUtf(extra,helperClass); extra.push_back(7); put2(extra,count);
@@ -128,17 +147,23 @@ inline bool transform(const Bytes& in, const char* targetMethod, const char* hel
     putRef(extra,12,uint16_t(count+3),uint16_t(count+2)); putRef(extra,10,uint16_t(count+1),uint16_t(count+4));
     putUtf(extra,"packetPitch"); putRef(extra,12,uint16_t(count+6),uint16_t(count+2));
     putRef(extra,10,uint16_t(count+1),uint16_t(count+7));
-    if(pickOk) {
-        // Same descriptor as the call it replaces, so the arguments already on the stack stand.
-        putUtf(extra,"tyrant/internal/SilentPickHelper");
-        extra.push_back(7); put2(extra,uint16_t(count+9));
-        putUtf(extra,"pick");
-        putUtf(extra,"(Lftk;Lftm;D)Lftk;");
-        putRef(extra,12,uint16_t(count+11),uint16_t(count+12));
-        putRef(extra,10,uint16_t(count+10),uint16_t(count+13));
-    }
+    // Both pick helpers are always in the pool, so the patch below only has to choose a reference:
+    // `pick` takes the same arguments checkCrosshairTargetRange already has on the stack, `pickFull`
+    // takes the receiver (the player) first, which is exactly the shape of the method_76763 call.
+    putUtf(extra,"tyrant/internal/SilentPickHelper");                                        // count+9
+    extra.push_back(7); put2(extra,uint16_t(count+9));                                       // count+10 Class
+    putUtf(extra,"pick");                                                                    // count+11
+    putUtf(extra,"(Lnet/minecraft/class_239;Lnet/minecraft/class_243;D)Lnet/minecraft/class_239;"); // count+12
+    putRef(extra,12,uint16_t(count+11),uint16_t(count+12));                                  // count+13
+    putRef(extra,10,uint16_t(count+10),uint16_t(count+13));                                  // count+14
+    putUtf(extra,"tyrant/internal/SilentPickHelper");                                        // count+15
+    extra.push_back(7); put2(extra,uint16_t(count+15));                                      // count+16 Class
+    putUtf(extra,"pickFull");                                                                // count+17
+    putUtf(extra,"(Lnet/minecraft/class_746;Lnet/minecraft/class_1297;DDF)Lnet/minecraft/class_239;"); // count+18
+    putRef(extra,12,uint16_t(count+17),uint16_t(count+18));                                  // count+19
+    putRef(extra,10,uint16_t(count+16),uint16_t(count+19));                                  // count+20
     Bytes result; result.reserve(in.size()+extra.size());
-    result.insert(result.end(),in.begin(),in.begin()+8); put2(result,uint16_t(count+(pickOk?15:9)));
+    result.insert(result.end(),in.begin(),in.begin()+8); put2(result,uint16_t(count+21));
     result.insert(result.end(),in.begin()+10,in.begin()+cpEnd); result.insert(result.end(),extra.begin(),extra.end());
     result.insert(result.end(),in.begin()+cpEnd,in.end());
     for(const Patch& patch:patches) {
@@ -146,10 +171,16 @@ inline bool transform(const Bytes& in, const char* targetMethod, const char* hel
         uint16_t ref=uint16_t(count+(patch.pitch?8:5)); result[at+1]=uint8_t(ref>>8); result[at+2]=uint8_t(ref);
     }
     if(pickOk) {
-        size_t at=pickSites[0]+extra.size(); result[at]=0xb8; uint16_t ref=uint16_t(count+14);
-        result[at+1]=uint8_t(ref>>8); result[at+2]=uint8_t(ref);
+        const std::vector<size_t>& sites=fullOk?fullSites:rangeSites;
+        const uint16_t ref=uint16_t(count+(fullOk?20:14));
+        for(size_t site:sites) {
+            size_t at=site+extra.size(); result[at]=0xb8;
+            result[at+1]=uint8_t(ref>>8); result[at+2]=uint8_t(ref);
+        }
     }
     if(pickPatched) *pickPatched=pickOk;
+    // 1 = the pick method's own raycast call is replaced, 2 = the range-check fallback, 0 = neither.
+    if(pickKind) *pickKind=pickOk?(fullOk?1:2):0;
     out=std::move(result); return true;
 }
 } // namespace tyr::jni::silent_transform

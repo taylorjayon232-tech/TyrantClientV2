@@ -2708,6 +2708,12 @@ bool g_maceChestSwapped = false;  // the chestplate went on, so the elytra has t
 constexpr int kMaceAxeTries = 3;
 int g_maceAxeTries = 0;
 int  g_maceHitDelayMs = 0;        // the hit delay rolled for this smash
+// The axe is swapped in and then clicked. The selection is synced at once, but the server resolves
+// the attack against the item it has when the packet lands there, so a click sent in the same breath
+// as the swap is still read as the mace (or whatever was in hand) and the shield is never disabled.
+// A short beat between the two makes the stun land.
+constexpr double kStunAxeSwapDwell = 0.025;   // 25 ms from the axe in hand to the click
+double g_maceAxeSwapAt = 0.0;                 // when the axe was last selected
 
 int maceRandMs(int lo, int hi) {
     lo = std::clamp(lo, 0, 5000); hi = std::clamp(hi, 0, 5000);
@@ -2782,6 +2788,12 @@ void maceRestoreSlot() {
     if (current != slot) selectSlot(inventory.get(), slot);
 }
 
+// Select the axe and remember when: the swing waits out kStunAxeSwapDwell from this moment.
+void maceSelectAxe(jobject inventory, int slot, double now) {
+    selectSlot(inventory, slot);
+    g_maceAxeSwapAt = now;
+}
+
 void maceResetState(bool restore) {
     if (restore) {
         maceRestoreSlot();
@@ -2803,6 +2815,7 @@ void maceResetState(bool restore) {
     g_maceStageAt = 0.0;
     g_maceTarget.clear();
     g_maceHitDelayMs = 0;
+    g_maceAxeSwapAt = 0.0;
     g_maceAxeTries = 0;
     g_maceOrigSlot = -1;
     g_maceChestSwapped = false;
@@ -2863,7 +2876,7 @@ void updateAutoMace() {
             g_maceHitDelayMs = 0;
             const int axe = maceFindHotbarAxe(list.get());
             if (st.stunSlam && axe >= 0 && mc::LivingEntity(target.get()).blocking()) {
-                selectSlot(inventory.get(), axe);
+                maceSelectAxe(inventory.get(), axe, now);
                 g_macePhase = MacePhase::AxeSwing;
                 g_maceStageAt = now + maceSeconds(st.swapDelayMs);
                 return;
@@ -2879,10 +2892,13 @@ void updateAutoMace() {
             const int axe = maceFindHotbarAxe(list.get());
             if (axe < 0) { maceResetState(true); return; }
             if (!maceHoldingSlotItem(list.get(), playerObj, axe)) {
-                selectSlot(inventory.get(), axe);          // the selection did not take: retry it
+                maceSelectAxe(inventory.get(), axe, now);  // the selection did not take: retry it
                 g_maceStageAt = now + maceSeconds(st.swapDelayMs);
                 return;
             }
+            // The axe is in hand on the client; give the slot update the beat it needs to be on the
+            // wire before the click, or the server still has the old item and the shield stays up.
+            if (now - g_maceAxeSwapAt < kStunAxeSwapDwell) return;
             if (!clickAttackPress(now)) return;
             noteModuleSwing(now);
             ++g_maceAxeTries;
@@ -2902,7 +2918,7 @@ void updateAutoMace() {
                 if (g_maceAxeTries >= kMaceAxeTries) { maceResetState(true); return; }
                 const int axe = maceFindHotbarAxe(list.get());
                 if (axe < 0) { maceResetState(true); return; }
-                if (!maceHoldingSlotItem(list.get(), playerObj, axe)) selectSlot(inventory.get(), axe);
+                if (!maceHoldingSlotItem(list.get(), playerObj, axe)) maceSelectAxe(inventory.get(), axe, now);
                 g_macePhase = MacePhase::AxeSwing;
                 g_maceStageAt = now + maceSeconds(maceRandMs(st.axeDelayMinMs, st.axeDelayMaxMs));
                 return;
@@ -2966,7 +2982,7 @@ void updateAutoMace() {
             if (st.stunSlam && mc::LivingEntity(target.get()).blocking() && g_maceAxeTries < kMaceAxeTries) {
                 const int axe = maceFindHotbarAxe(list.get());
                 if (axe >= 0) {
-                    selectSlot(inventory.get(), axe);
+                    maceSelectAxe(inventory.get(), axe, now);
                     g_macePhase = MacePhase::AxeSwing;
                     g_maceStageAt = now + maceSeconds(st.swapDelayMs);
                     return;
@@ -7334,6 +7350,13 @@ void drawOverlay(float tickDelta) {
                  (double)g_dbgHead, (double)g_dbgLastHead, (double)g_silentCameraYawNow,
                  (double)g_dbgEofBody, (double)g_dbgRenderYaw, g_dbgClobbers, g_dbgReleases);
         dl->AddText(ImVec2(12.f, 140.f), IM_COL32(255, 92, 92, 255), dbg);
+        // Which pick the game is using: the aim's own raycast when the transform installed, the
+        // range-check fallback, or the camera's pick (only the field write then).
+        const int pickMode = jni::silentAimPickMode();
+        snprintf(dbg, sizeof(dbg), "pick %s | camera look: %s",
+                 pickMode == 1 ? "aim (full)" : pickMode == 2 ? "aim (range)" : "camera",
+                 g_cameraOnEntity ? "entity" : (g_cameraOnBlock ? "block" : "nothing"));
+        dl->AddText(ImVec2(12.f, 172.f), IM_COL32(150, 210, 255, 255), dbg);
         // -9999 anywhere in that line means the field id never resolved.
         if (g_dbgLastBody < -999.f || g_dbgLastHead < -999.f ||
             std::abs(g_dbgBody - g_silentBodyWrittenYaw) > 1.f)

@@ -16,6 +16,7 @@ void silentRotationShutdown();
 // ClientPlayerEntity.getCrosshairTarget): the HUD attack indicator, the block outline and vanilla's
 // own doAttack/doItemUse all resolve against the silent rotation, and the camera is untouched.
 bool silentAimPickActive();
+int  silentAimPickMode();   // 1 full pick, 2 range fallback, 0 none
 // The game's own camera pick for the current frame as a new local ref (caller deletes), or null.
 // Only meaningful while silentAimPickActive(): `crosshairTarget` then holds the aim's pick.
 jobject silentAimCameraPick();
